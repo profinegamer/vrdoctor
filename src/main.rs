@@ -1251,7 +1251,9 @@ pub(crate) fn run_checks() -> Vec<CheckResult> {
     let steam_games = list_games(&cfg);
     push("Steam games detected", !steam_games.is_empty(), format!("{} installed title(s) in Steam libraries", steam_games.len()));
     let custom = load_custom_games();
-    push("Custom games", !custom.is_empty(), format!("{} custom (non-store) game(s) in {}", custom.len(), custom_games_path().display()));
+    // Zero custom games is a perfectly normal state, not a failure —
+    // this check is informational (the count + where they're stored).
+    push("Custom games", true, format!("{} custom (non-store) game(s) in {}", custom.len(), custom_games_path().display()));
 
     let quests = detect_quest();
     if quests.is_empty() {
