@@ -26,8 +26,12 @@ rm -rf "$APPDIR" "$OUT"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/512x512/apps"
 
 install -m755 target/release/vrdoctor "$APPDIR/usr/bin/vrdoctor"
+# vrdoctor-vr, the in-headset UI — must sit next to vrdoctor so
+# `vrdoctor vr` finds it (and so the AppImage's `vr` subcommand works).
+install -m755 target/release/vrdoctor-vr "$APPDIR/usr/bin/vrdoctor-vr"
 install -m644 vrdoctor.desktop "$APPDIR/vrdoctor.desktop"
 install -m644 vrdoctor.desktop "$APPDIR/usr/share/applications/vrdoctor.desktop"
+install -m644 vrdoctor-vr.desktop "$APPDIR/usr/share/applications/vrdoctor-vr.desktop"
 
 # Icon (generated at build time by make-icon.py, committed as vrdoctor.png if present).
 if [ ! -f vrdoctor.png ]; then python3 make-icon.py; fi

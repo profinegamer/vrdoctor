@@ -6,9 +6,9 @@ use eframe::egui;
 use std::path::PathBuf;
 
 use crate::{
-    art_path, capture, classify_game, current_distro, download_art, fix_openvr, home_install, install_done, launch_steam_2d, list_games,
+    art_path, capture, classify_game, config_dir, current_distro, download_art, fix_openvr, home_install, install_done, launch_steam_2d, list_games,
     load_config, load_custom_games, mark_installed, quest_setup_steps, register_custom_game, remove_custom_game,
-    run_checks, run_installer_terminal, save_config, setup_plan, setup_plan_for_family, start_backend, start_bar,
+    install_plan, run_checks, run_installer_terminal, save_config, setup_plan, setup_plan_for_family, start_backend, start_bar,
     start_overlay, launch_custom_game, launch_steam_appid, CheckResult, Config, CustomGame, Family, Game, VrSupport,
     HOME_THEMES, SUPPORTED_KINDS,
 };
@@ -19,6 +19,19 @@ use crate::{
 /// rounded corners and comfortable spacing — applied to the GUI, the
 /// installer and the bar so everything looks like one product.
 pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(45, 212, 191);
+/// The alternative accent (user-selectable in the header, persisted as
+/// `accent=red` in config). The active accent lives in an atomic so the
+/// theme helpers and all three apps share it without plumbing.
+pub(crate) const ACCENT_RED: egui::Color32 = egui::Color32::from_rgb(239, 68, 68);
+static ACCENT_PACKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) fn accent() -> egui::Color32 {
+    let p = ACCENT_PACKED.load(std::sync::atomic::Ordering::Relaxed);
+    if p == 0 { ACCENT } else { egui::Color32::from_rgb((p >> 16) as u8, (p >> 8) as u8, p as u8) }
+}
+pub(crate) fn set_accent(c: egui::Color32) {
+    ACCENT_PACKED.store(((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn set_accent_from_config(cfg: &Config) { set_accent(if cfg.accent == "red" { ACCENT_RED } else { ACCENT }); }
 
 fn polished_visuals(dark: bool) -> egui::Visuals {
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
@@ -27,8 +40,8 @@ fn polished_visuals(dark: bool) -> egui::Visuals {
         w.rounding = round;
     }
     v.window_rounding = egui::Rounding::same(14.0);
-    v.selection.bg_fill = ACCENT;
-    v.hyperlink_color = ACCENT;
+    v.selection.bg_fill = accent();
+    v.hyperlink_color = accent();
     if dark {
         v.panel_fill = egui::Color32::from_rgb(13, 18, 32);
         v.window_fill = egui::Color32::from_rgb(13, 18, 32);
@@ -95,6 +108,31 @@ enum Tab { Games, Doctor, AddGame, Shell, Setup }
 /// the UI pass so borrows stay simple.
 enum Pending { Steam(u64), Steam2d(u64), Custom(CustomGame) }
 
+/// Remove everything VRDoctor created in the user's own folders:
+/// its config/settings (incl. custom games and VR Home panoramas), the
+/// extracted-games library, the cover-art cache, and its desktop
+/// entries. System packages (WiVRn, Steam, …) are shared with other
+/// apps and are deliberately left alone. Returns a report of what went.
+fn uninstall_user_files() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
+    let cache_home = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{home}/.cache"));
+    let mut report = Vec::new();
+    for f in ["vrdoctor.desktop", "vrdoctor-vr.desktop"] {
+        let p = PathBuf::from(&data_home).join("applications").join(f);
+        if p.exists() {
+            match std::fs::remove_file(&p) { Ok(()) => report.push(format!("Removed {}", p.display())), Err(e) => report.push(format!("Could not remove {}: {e}", p.display())) }
+        }
+    }
+    for d in [config_dir(), PathBuf::from(&data_home).join("vrdoctor"), PathBuf::from(&cache_home).join("vrdoctor")] {
+        if d.exists() {
+            match std::fs::remove_dir_all(&d) { Ok(()) => report.push(format!("Removed {}", d.display())), Err(e) => report.push(format!("Could not remove {}: {e}", d.display())) }
+        }
+    }
+    if report.is_empty() { report.push("Nothing to remove — VRDoctor has no files in your user folders.".to_string()); }
+    report
+}
+
 /// Background-download missing Steam cover art, then ask for a repaint.
 fn spawn_art_download(ctx: &egui::Context, appids: Vec<u64>) {
     let ctx = ctx.clone();
@@ -124,6 +162,7 @@ fn truncate_name(name: &str, max: usize) -> String {
 pub struct VrDoctorApp {
     cfg: Config,
     dark_mode: bool,
+    accent_red: bool,
     tab: Tab,
     backend: String,
     status: String,
@@ -148,21 +187,31 @@ pub struct VrDoctorApp {
     pending: Option<Pending>,
     textures: std::collections::HashMap<u64, egui::TextureHandle>,
     art_bad: std::collections::HashSet<u64>,
+    /// VR/2D classification per Steam AppID, computed ONCE per refresh.
+    /// classify_game() can recursively walk a game's install folder, so
+    /// calling it per tile per frame (the v0.7.0 behaviour) made the GUI
+    /// lag badly on real libraries.
+    vr_info: std::collections::HashMap<u64, (VrSupport, String)>,
+    confirm_uninstall: bool,
 }
 
 impl VrDoctorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = load_config();
         let dark_mode = cfg.theme != "light"; // dark is the default
+        set_accent_from_config(&cfg);
         apply_polish(&cc.egui_ctx, dark_mode);
         let backend = cfg.backend.clone();
         let games = list_games(&cfg);
         spawn_art_download(&cc.egui_ctx, games.iter().map(|g| g.appid).collect());
+        let vr_info = games.iter().map(|g| (g.appid, classify_game(g, false))).collect();
+        let accent_red = cfg.accent == "red";
         Self {
             steam_games: games,
             custom_games: load_custom_games(),
             cfg,
             dark_mode,
+            accent_red,
             tab: Tab::Games,
             backend,
             status: "Ready. Pick a game, or run Doctor to check your setup.".into(),
@@ -183,6 +232,8 @@ impl VrDoctorApp {
             pending: None,
             textures: std::collections::HashMap::new(),
             art_bad: std::collections::HashSet::new(),
+            vr_info,
+            confirm_uninstall: false,
         }
     }
 
@@ -209,11 +260,29 @@ impl VrDoctorApp {
     fn refresh_games(&mut self) {
         self.steam_games = list_games(&self.cfg);
         self.custom_games = load_custom_games();
+        self.reclassify();
+    }
+
+    /// Classify every Steam game once and cache the results for the UI.
+    fn reclassify(&mut self) {
+        self.vr_info = self.steam_games.iter().map(|g| (g.appid, classify_game(g, false))).collect();
+    }
+
+    /// Cached classification for a game (Unknown if not computed yet).
+    fn class_of(&self, g: &Game) -> (VrSupport, String) {
+        self.vr_info.get(&g.appid).cloned().unwrap_or((VrSupport::Unknown, "not checked".to_string()))
     }
 
     fn apply_theme(&mut self, ctx: &egui::Context) {
         apply_polish(ctx, self.dark_mode);
         self.cfg.theme = if self.dark_mode { "dark".into() } else { "light".into() };
+        let _ = save_config(&self.cfg);
+    }
+
+    fn apply_accent(&mut self, ctx: &egui::Context) {
+        set_accent(if self.accent_red { ACCENT_RED } else { ACCENT });
+        apply_polish(ctx, self.dark_mode);
+        self.cfg.accent = if self.accent_red { "red".into() } else { "teal".into() };
         let _ = save_config(&self.cfg);
     }
 }
@@ -222,12 +291,15 @@ impl eframe::App for VrDoctorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("🩺 VRDoctor").size(23.0).strong().color(ACCENT));
+                ui.label(egui::RichText::new("🩺 VRDoctor").size(23.0).strong().color(accent()));
                 ui.label("PCVR on Meta Quest 3 — Arch & Fedora Linux");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.checkbox(&mut self.dark_mode, "🌙 Dark mode").changed() {
                         self.apply_theme(ctx);
                     }
+                    ui.label("Accent:");
+                    if ui.selectable_value(&mut self.accent_red, true, "Red").changed() { self.apply_accent(ctx); }
+                    if ui.selectable_value(&mut self.accent_red, false, "Teal").changed() { self.apply_accent(ctx); }
                 });
             });
             ui.horizontal(|ui| {
@@ -277,7 +349,7 @@ impl VrDoctorApp {
                 }
                 if ui.button("🔍 Check Steam online (VR or 2D?)").clicked() {
                     let mut known = 0;
-                    for g in &self.steam_games { if classify_game(g, true).0 != VrSupport::Unknown { known += 1; } }
+                    for g in &self.steam_games { let r = classify_game(g, true); if r.0 != VrSupport::Unknown { known += 1; } self.vr_info.insert(g.appid, r); }
                     self.status = format!("Checked Steam: {known}/{} games classified. Badges: VR = VR-only · VR+2D = plays both ways · 2D = flat game · ? = not checked.", self.steam_games.len());
                 }
             });
@@ -306,7 +378,7 @@ impl VrDoctorApp {
     fn detail_bar(&mut self, ui: &mut egui::Ui) {
         if let Some(appid) = self.selected_steam {
             if let Some(g) = self.steam_games.iter().find(|g| g.appid == appid).cloned() {
-                let (sup, src) = classify_game(&g, false);
+                let (sup, src) = self.class_of(&g);
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
@@ -319,7 +391,7 @@ impl VrDoctorApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("✕").clicked() { self.selected_steam = None; }
                             if ui.button("▶ 2D").clicked() { self.pending = Some(Pending::Steam2d(g.appid)); }
-                            let launch = egui::Button::new(egui::RichText::new("▶ Launch").strong().color(egui::Color32::from_rgb(6, 24, 22))).fill(ACCENT);
+                            let launch = egui::Button::new(egui::RichText::new("▶ Launch").strong().color(egui::Color32::from_rgb(6, 24, 22))).fill(accent());
                             if ui.add(launch).clicked() { self.pending = Some(Pending::Steam(g.appid)); }
                         });
                     });
@@ -335,7 +407,7 @@ impl VrDoctorApp {
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("✕").clicked() { self.selected_custom = None; }
-                            let launch = egui::Button::new(egui::RichText::new("▶ Launch").strong().color(egui::Color32::from_rgb(6, 24, 22))).fill(ACCENT);
+                            let launch = egui::Button::new(egui::RichText::new("▶ Launch").strong().color(egui::Color32::from_rgb(6, 24, 22))).fill(accent());
                             if ui.add(launch).clicked() { self.pending = Some(Pending::Custom(g.clone())); }
                         });
                     });
@@ -350,11 +422,11 @@ impl VrDoctorApp {
         let steam: Vec<Game> = self.steam_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(needle)).cloned().collect();
         egui::ScrollArea::vertical().show(ui, |ui| {
             if !custom.is_empty() {
-                ui.label(egui::RichText::new("Custom games").size(17.0).strong().color(ACCENT));
+                ui.label(egui::RichText::new("Custom games").size(17.0).strong().color(accent()));
                 ui.horizontal(|ui| { for g in &custom { self.custom_tile(ui, g); } });
                 ui.add_space(8.0);
             }
-            ui.label(egui::RichText::new("Steam games").size(17.0).strong().color(ACCENT));
+            ui.label(egui::RichText::new("Steam games").size(17.0).strong().color(accent()));
             ui.small("Cover art comes from Steam. Click a game for details; ▶ launches, 2D plays it on the big screen.");
             if steam.is_empty() { ui.label("No Steam games found. Check Doctor — Steam may not be installed yet."); }
             let cols = (((ui.available_width() + 14.0) / 176.0) as usize).max(1);
@@ -380,12 +452,12 @@ impl VrDoctorApp {
                 }
             }
             if self.selected_steam == Some(g.appid) {
-                ui.painter().rect_stroke(rect, egui::Rounding::same(8.0), egui::Stroke::new(2.5, ACCENT));
+                ui.painter().rect_stroke(rect, egui::Rounding::same(8.0), egui::Stroke::new(2.5, accent()));
             }
             if resp.clicked() { self.selected_steam = Some(g.appid); self.selected_custom = None; }
             ui.label(egui::RichText::new(truncate_name(&g.name, 24)).strong());
             ui.horizontal(|ui| {
-                let (sup, _) = classify_game(g, false);
+                let (sup, _) = self.class_of(g);
                 badge(ui, sup);
                 if ui.small_button("▶ Launch").clicked() { self.pending = Some(Pending::Steam(g.appid)); }
                 if ui.small_button("2D").clicked() { self.pending = Some(Pending::Steam2d(g.appid)); }
@@ -404,7 +476,7 @@ impl VrDoctorApp {
             p.text(rect.center() - egui::vec2(0.0, 16.0), egui::Align2::CENTER_CENTER, letter, egui::FontId::proportional(64.0), egui::Color32::from_white_alpha(220));
             p.text(rect.center() + egui::vec2(0.0, 54.0), egui::Align2::CENTER_CENTER, if g.mode == "2d" { "2D · custom" } else { "custom game" }, egui::FontId::proportional(13.0), egui::Color32::from_white_alpha(160));
             if self.selected_custom.as_deref() == Some(g.name.as_str()) {
-                ui.painter().rect_stroke(rect, egui::Rounding::same(8.0), egui::Stroke::new(2.5, ACCENT));
+                ui.painter().rect_stroke(rect, egui::Rounding::same(8.0), egui::Stroke::new(2.5, accent()));
             }
             if resp.clicked() { self.selected_custom = Some(g.name.clone()); self.selected_steam = None; }
             ui.label(egui::RichText::new(truncate_name(&g.name, 24)).strong());
@@ -456,7 +528,7 @@ impl VrDoctorApp {
                     ui.horizontal(|ui| {
                         if ui.button("▶ Launch").clicked() { steam_launch = Some(g.clone()); }
                         if ui.button("▶ 2D").clicked() { steam_launch_2d = Some(g.clone()); }
-                        let (sup, _src) = classify_game(g, false);
+                        let (sup, _src) = self.class_of(g);
                         badge(ui, sup);
                         ui.strong(&g.name);
                         ui.small(format!("AppID {}", g.appid));
@@ -595,6 +667,22 @@ impl VrDoctorApp {
             }
         });
         ui.separator();
+        ui.heading("Uninstall");
+        ui.label("Remove VRDoctor's own files: settings, custom games, VR Home, cover-art cache and menu entries. The VR packages it installed (WiVRn and friends) are shared system packages and are left in place — remove them with your package manager if you want them gone too (Arch: wivrn-dashboard · Fedora: wivrn). Afterwards, delete the VRDoctor AppImage file itself and the app is fully gone.");
+        if !self.confirm_uninstall {
+            if ui.button("🗑 Uninstall VRDoctor…").clicked() { self.confirm_uninstall = true; }
+        } else {
+            ui.colored_label(egui::Color32::from_rgb(248, 113, 113), "This deletes your VRDoctor settings and custom game list. There is no undo.");
+            ui.horizontal(|ui| {
+                if ui.button("Yes, remove VRDoctor's files").clicked() {
+                    let report = uninstall_user_files();
+                    self.status = format!("Uninstall: {}", report.join(" · "));
+                    self.confirm_uninstall = false;
+                }
+                if ui.button("Cancel").clicked() { self.confirm_uninstall = false; }
+            });
+        }
+        ui.separator();
         ui.label("Run these in a terminal (or `vrdoctor setup --apply`):");
         egui::ScrollArea::vertical().show(ui, |ui| {
             for line in setup_plan(&distro) { ui.monospace(line); }
@@ -620,6 +708,7 @@ impl InstallerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = load_config();
         let dark_mode = cfg.theme != "light";
+        set_accent_from_config(&cfg);
         apply_polish(&cc.egui_ctx, dark_mode);
         let distro = current_distro();
         let family = match distro.family { Family::Arch | Family::Fedora => distro.family.clone(), _ => Family::Arch };
@@ -630,7 +719,7 @@ impl InstallerApp {
 impl eframe::App for InstallerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(egui::RichText::new("🩺 VRDoctor installer").size(23.0).strong().color(ACCENT));
+            ui.label(egui::RichText::new("🩺 VRDoctor installer").size(23.0).strong().color(accent()));
             ui.label(format!("Detected: {}. If that's wrong, just pick the right one:", self.detected));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -640,7 +729,7 @@ impl eframe::App for InstallerApp {
             ui.add_space(8.0);
             ui.label(format!("Install plan for {:?}:", self.family));
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                for line in setup_plan_for_family(&self.family) { ui.monospace(line); }
+                for line in install_plan(&self.family) { ui.monospace(line); }
             });
             ui.add_space(6.0);
             ui.label("Plus, on the Quest 3: install the WiVRn client app (version must match the PC server), and join the same 5/6 GHz Wi-Fi as the PC.");
@@ -690,6 +779,7 @@ pub struct BarApp {
 
 impl BarApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        set_accent_from_config(&load_config());
         apply_polish(&cc.egui_ctx, true); // the bar is always dark, like Quest's
         Self { battery: quest_battery(), frames: 0 }
     }
@@ -719,7 +809,7 @@ impl eframe::App for BarApp {
                 .inner_margin(egui::Margin::symmetric(18.0, 8.0))
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
-                        ui.label(egui::RichText::new("🩺 VRDoctor").strong().color(ACCENT).size(16.0));
+                        ui.label(egui::RichText::new("🩺 VRDoctor").strong().color(accent()).size(16.0));
                         ui.separator();
                         ui.label(egui::RichText::new(format!("🕐 {clock}")).strong().size(19.0));
                         ui.small(date);

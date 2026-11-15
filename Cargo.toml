@@ -1,6 +1,6 @@
 [package]
 name = "vrdoctor"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 description = "VRDoctor — Linux launcher for PCVR games on Meta Quest 3 (Arch & Fedora) via WiVRn / ALVR / Steam Link, with a dark-mode GUI and custom (non-store) games"
@@ -9,6 +9,10 @@ rust-version = "1.74"
 [[bin]]
 name = "vrdoctor"
 path = "src/main.rs"
+
+[[bin]]
+name = "vrdoctor-vr"
+path = "src/vr.rs"
 
 [dependencies]
 eframe = { version = "0.29", default-features = false, features = [
@@ -20,6 +24,14 @@ eframe = { version = "0.29", default-features = false, features = [
 # Pure-Rust PNG encoder, used to procedurally render the VR Home panorama.
 png = "0.17"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# vrdoctor-vr (the in-headset UI): OpenXR with the loader dlopened at
+# runtime (no build-time link), EGL via dynamic loading, glow for GL,
+# fontdue for CPU text rasterisation.
+openxr = { version = "0.19", features = ["loaded"] }
+glow = "0.13"
+khronos-egl = { version = "6", features = ["dynamic"] }
+libloading = "0.8"
+fontdue = "0.9"
 
 [profile.release]
 opt-level = 3

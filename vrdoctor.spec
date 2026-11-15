@@ -1,5 +1,5 @@
 Name:           vrdoctor
-Version:        0.7.1
+Version:        0.8.0
 Release:        1%{?dist}
 Summary:        GUI + CLI launcher for PCVR games on Meta Quest 3 via WiVRn / ALVR, with custom non-store games
 License:        MIT
@@ -18,8 +18,12 @@ cargo build --release
 
 %install
 install -Dm755 target/release/vrdoctor %{buildroot}%{_bindir}/vrdoctor
+install -Dm755 target/release/vrdoctor-vr %{buildroot}%{_bindir}/vrdoctor-vr
 install -Dm644 vrdoctor.desktop %{buildroot}%{_datadir}/applications/vrdoctor.desktop
+install -Dm644 vrdoctor-vr.desktop %{buildroot}%{_datadir}/applications/vrdoctor-vr.desktop
 
 %files
 %{_bindir}/vrdoctor
+%{_bindir}/vrdoctor-vr
 %{_datadir}/applications/vrdoctor.desktop
+%{_datadir}/applications/vrdoctor-vr.desktop

@@ -105,6 +105,27 @@ vrdoctor gui
 - **VR Shell tab** — install VR Home (with brightness slider) and start 2D mode / the bar.
 - **Setup tab** — the Arch/Fedora install steps, Quest-side steps, and a button to re-open the installer.
 
+## In-headset VR UI — VRDoctor VR 🥽
+
+New in v0.8.0: VRDoctor has a real VR front-end, styled after the Steam Frame's floating-panel library. Connect your headset in WiVRn, open **VRDoctor VR** from WiVRn's own app launcher (it appears there automatically after install), and you're standing in your VR Home in front of a big panel with your whole library — cover art, VR / VR+2D / 2D badges and all. Point a controller at a game and pull the trigger: VRDoctor launches it and steps aside.
+
+```bash
+vrdoctor vr                  # register with WiVRn and open the VR UI now
+vrdoctor vr --register-only  # just (re)write the WiVRn launcher entry
+```
+
+Under the hood it's a native OpenXR app (`vrdoctor-vr`, OpenGL via EGL) that reads the same library as the desktop app — Steam games are sorted VR-first, custom games included. WiVRn finds it through a desktop entry with the `X-WiVRn-VR` category in `~/.local/share/applications` (written by the installer, by `vrdoctor vr`, or shipped by the packages). Honest status: verified end-to-end against Monado's simulated headset (real session, frames rendered); the first run on a real Quest may still surface quirks — reports welcome.
+
+## Flatpak Steam
+
+If your Steam is the Flatpak (`com.valvesoftware.Steam`), VRDoctor uses it as-is: it detects which Steam actually holds your games, launches through `flatpak run com.valvesoftware.Steam`, and **never installs a duplicate native Steam** (the install plan skips the Steam package when any Steam is already present). Because Flatpak Steam is sandboxed, it also can't see WiVRn by default — `vrdoctor install` applies the documented visibility fix automatically for Flatpak users, and you can re-apply it any time with:
+
+```bash
+vrdoctor fix-flatpak
+```
+
+That grants Steam read access to `xdg-run/wivrn`, `xdg-config/openxr` and `xdg-config/openvr` and links your OpenXR config into the sandbox.
+
 Building the GUI needs X11/Wayland headers on some systems — Fedora: `sudo dnf install libXcursor-devel libXi-devel libXrandr-devel libxkbcommon-devel wayland-devel`. Arch usually has what's needed via base-devel and desktop deps.
 
 ## Custom (non-store) games — almost any file type

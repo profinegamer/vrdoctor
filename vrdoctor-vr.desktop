@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VRDoctor VR
+Comment=VRDoctor's in-headset library — pick a game in VR and play
+Exec=vrdoctor-vr
+Icon=vrdoctor
+Terminal=false
+Categories=Game;X-WiVRn-VR;

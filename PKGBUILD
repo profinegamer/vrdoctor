@@ -1,6 +1,6 @@
 # Maintainer: VRDoctor contributors
 pkgname=vrdoctor
-pkgver=0.7.1
+pkgver=0.8.0
 pkgrel=1
 pkgdesc="GUI + CLI launcher for PCVR games on Meta Quest 3 via WiVRn / ALVR, with custom non-store games"
 arch=('x86_64')
@@ -15,5 +15,7 @@ source=()
 build() { cargo build --release --locked 2>/dev/null || cargo build --release; }
 package() {
   install -Dm755 "target/release/vrdoctor" "$pkgdir/usr/bin/vrdoctor"
+  install -Dm755 "target/release/vrdoctor-vr" "$pkgdir/usr/bin/vrdoctor-vr"
   install -Dm644 "vrdoctor.desktop" "$pkgdir/usr/share/applications/vrdoctor.desktop"
+  install -Dm644 "vrdoctor-vr.desktop" "$pkgdir/usr/share/applications/vrdoctor-vr.desktop"
 }

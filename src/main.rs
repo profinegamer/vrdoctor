@@ -87,6 +87,133 @@ pub(crate) fn flatpak_installed(app_id: &str) -> bool {
     capture("flatpak", &["list", "--app", "--columns=application"]).map(|s| s.lines().any(|l| l.trim() == app_id)).unwrap_or(false)
 }
 
+// ------------------------------------------------------- which Steam?
+
+/// Which Steam does this PC actually use? v0.7.1's installer blindly
+/// installed the native pacman Steam even when the user already had
+/// Flatpak Steam — then launches went through the fresh, signed-out
+/// native copy and Steam asked to sign in again. Detect the flavour
+/// that owns the game library instead, and never install a duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteamFlavour { Flatpak, Native, None }
+
+fn flatpak_steam_root() -> PathBuf {
+    PathBuf::from(env::var("HOME").unwrap_or_default())
+        .join(".var/app/com.valvesoftware.Steam/.local/share/Steam")
+}
+
+fn native_steam_roots() -> Vec<PathBuf> {
+    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+    vec![home.join(".local/share/Steam"), home.join(".steam/steam")]
+}
+
+/// How many installed Steam games live under this root (appmanifests)?
+fn steam_game_count(root: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(root.join("steamapps")) else { return 0 };
+    entries.flatten().filter(|e| {
+        let n = e.file_name().to_string_lossy().to_string();
+        n.starts_with("appmanifest_") && n.ends_with(".acf")
+    }).count()
+}
+
+/// Pure flavour choice, given what is installed and where the games are.
+/// The flavour with games wins; with games on both, the one with more
+/// wins; with no games anywhere, the installed one wins (native on a tie).
+pub(crate) fn pick_steam_flavour(flatpak: bool, native: bool, flatpak_games: usize, native_games: usize) -> SteamFlavour {
+    if flatpak_games > 0 || native_games > 0 {
+        if flatpak_games > native_games { return SteamFlavour::Flatpak; }
+        if native_games > flatpak_games { return SteamFlavour::Native; }
+        // Equal non-zero counts: prefer the Flatpak library if the native
+        // one is a fresh empty-looking install is impossible to tell here,
+        // so fall through to the installed-flavour rule below.
+    }
+    if flatpak && !native { return SteamFlavour::Flatpak; }
+    if native && !flatpak { return SteamFlavour::Native; }
+    if flatpak && native { return SteamFlavour::Native; }
+    SteamFlavour::None
+}
+
+pub(crate) fn detect_steam_flavour(_cfg: &Config) -> SteamFlavour {
+    let flatpak = flatpak_installed("com.valvesoftware.Steam");
+    let native = which("steam").is_some();
+    let flatpak_games = steam_game_count(&flatpak_steam_root());
+    let native_games = native_steam_roots().iter().map(|r| steam_game_count(r)).sum();
+    pick_steam_flavour(flatpak, native, flatpak_games, native_games)
+}
+
+impl SteamFlavour {
+    pub(crate) fn label(self) -> &'static str {
+        match self { SteamFlavour::Flatpak => "Flatpak Steam", SteamFlavour::Native => "native Steam", SteamFlavour::None => "no Steam" }
+    }
+}
+
+/// The command that launches a Steam game through the Steam the user
+/// actually uses. Flatpak Steam is sandboxed: it is launched with
+/// `flatpak run … -applaunch`, never by calling a `steam` binary that
+/// may be the wrong (duplicate) install.
+pub(crate) fn steam_launch_command(flavour: SteamFlavour, appid: u64) -> Command {
+    match flavour {
+        SteamFlavour::Flatpak => {
+            let mut c = Command::new("flatpak");
+            c.args(["run", "com.valvesoftware.Steam", "-applaunch", &appid.to_string()]);
+            c
+        }
+        _ => {
+            let mut c = Command::new("steam");
+            c.args(["-applaunch", &appid.to_string()]);
+            c
+        }
+    }
+}
+
+/// Let Flatpak Steam see the WiVRn runtime: grant the sandbox read
+/// access to the WiVRn socket + OpenXR/OpenVR config, and symlink the
+/// runtime registration into the sandbox config. Without this, games
+/// launched from Flatpak Steam open flat on the monitor instead of in
+/// the headset. Idempotent — safe to run again.
+pub(crate) fn fix_flatpak_steam_visibility() -> Result<String, String> {
+    if !flatpak_installed("com.valvesoftware.Steam") {
+        return Err("Flatpak Steam is not installed, nothing to fix.".into());
+    }
+    let mut notes = vec![];
+    let out = Command::new("flatpak").args(["override", "--user",
+        "--filesystem=xdg-run/wivrn:ro", "--filesystem=xdg-config/openxr:ro",
+        "--filesystem=xdg-config/openvr:ro", "com.valvesoftware.Steam"]).output()
+        .map_err(|e| format!("flatpak override failed: {e}"))?;
+    if out.status.success() { notes.push("flatpak override: granted xdg-run/wivrn, xdg-config/openxr, xdg-config/openvr".to_string()); }
+    else { return Err(format!("flatpak override failed: {}", String::from_utf8_lossy(&out.stderr).trim())); }
+    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+    let target_dir = home.join(".var/app/com.valvesoftware.Steam/.config/openxr");
+    let _ = fs::create_dir_all(&target_dir);
+    let link = target_dir.join("1");
+    let src = home.join(".config/openxr/1");
+    if src.exists() && !link.exists() {
+        #[cfg(unix)] { use std::os::unix::fs::symlink; let _ = symlink(&src, &link); }
+        notes.push(format!("linked {} → {}", link.display(), src.display()));
+    }
+    Ok(notes.join("\n"))
+}
+
+/// The install plan for this PC: the canonical plan for the distro,
+/// minus the Steam package when a Steam is already installed — VRDoctor
+/// must never install a duplicate Steam over the one with your games.
+pub(crate) fn install_plan(family: &Family) -> Vec<String> {
+    let plan = setup_plan_for_family(family);
+    if detect_steam_flavour(&load_config()) == SteamFlavour::None { return plan; }
+    let mut out = vec![];
+    for line in plan {
+        let t = line.trim();
+        if t.starts_with("sudo pacman -S") && t.contains(" steam") {
+            out.push("# Steam already installed — skipped (VRDoctor uses the Steam with your games, no duplicate install)".into());
+            out.push(line.replacen(" steam", "", 1));
+        } else if t.starts_with("sudo dnf install steam") {
+            out.push("# Steam already installed — skipped (VRDoctor uses the Steam with your games, no duplicate install)".into());
+            out.push(line.replacen(" steam", "", 1));
+        } else { out.push(line); }
+    }
+    out
+}
+
 /// Shell-like argument splitting: honours single/double quotes and backslash escapes.
 pub(crate) fn split_args(input: &str) -> Vec<String> {
     let mut out = vec![];
@@ -120,11 +247,13 @@ pub(crate) struct Config {
     pub default_refresh: u32,
     /// "dark" (default) or "light"
     pub theme: String,
+    /// Accent colour: "teal" (default) or "red"
+    pub accent: String,
     pub proton: Option<PathBuf>,
 }
 
 impl Default for Config {
-    fn default() -> Self { Self { backend: "wivrn".into(), steam_root: None, default_refresh: 90, theme: "dark".into(), proton: None } }
+    fn default() -> Self { Self { backend: "wivrn".into(), steam_root: None, default_refresh: 90, theme: "dark".into(), accent: "teal".into(), proton: None } }
 }
 
 pub(crate) fn config_dir() -> PathBuf {
@@ -154,6 +283,7 @@ pub(crate) fn load_config() -> Config {
                 "steam_root" => cfg.steam_root = Some(PathBuf::from(v.trim())),
                 "default_refresh" => cfg.default_refresh = v.trim().parse().unwrap_or(90),
                 "theme" => cfg.theme = v.trim().to_string(),
+                "accent" => cfg.accent = v.trim().to_string(),
                 "proton" => cfg.proton = Some(PathBuf::from(v.trim())),
                 _ => {}
             }
@@ -165,7 +295,7 @@ pub(crate) fn load_config() -> Config {
 pub(crate) fn save_config(cfg: &Config) -> std::io::Result<PathBuf> {
     let p = config_path();
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
-    let mut s = format!("# vrdoctor config\nbackend={}\ndefault_refresh={}\ntheme={}\n", cfg.backend, cfg.default_refresh, cfg.theme);
+    let mut s = format!("# vrdoctor config\nbackend={}\ndefault_refresh={}\ntheme={}\naccent={}\n", cfg.backend, cfg.default_refresh, cfg.theme, cfg.accent);
     if let Some(r) = &cfg.steam_root { s.push_str(&format!("steam_root={}\n", r.display())); }
     if let Some(pr) = &cfg.proton { s.push_str(&format!("proton={}\n", pr.display())); }
     fs::write(&p, s)?;
@@ -479,6 +609,59 @@ pub(crate) fn download_art(appid: u64) -> bool {
     }
     let _ = fs::remove_file(&tmp);
     false
+}
+
+// ------------------------------------------------- machine-readable game list
+
+/// Escape a string for inclusion in a JSON string literal.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The game list as a JSON array — the contract `vrdoctor-vr` (the
+/// in-headset UI) consumes via `vrdoctor list-games --json`.
+/// Steam entries: {"kind":"steam","appid":N,"name":"…","vr":"vr|vr2d|2d|unknown"}
+/// Custom entries: {"kind":"custom","appid":0,"name":"…","vr":"vr|2d"}
+/// Classification is offline (cache + known titles + install markers).
+pub(crate) fn games_json(games: &[Game], custom: &[CustomGame]) -> String {
+    let vr_str = |sup: VrSupport| match sup {
+        VrSupport::VrOnly => "vr",
+        VrSupport::VrSupported => "vr2d",
+        VrSupport::Flat => "2d",
+        VrSupport::Unknown => "unknown",
+    };
+    let mut out = String::from("[");
+    let mut first = true;
+    for g in games {
+        if !first { out.push(','); }
+        first = false;
+        out.push_str(&format!(
+            "{{\"kind\":\"steam\",\"appid\":{},\"name\":\"{}\",\"vr\":\"{}\"}}",
+            g.appid, json_escape(&g.name), vr_str(classify_game(g, false).0)
+        ));
+    }
+    for g in custom {
+        if !first { out.push(','); }
+        first = false;
+        out.push_str(&format!(
+            "{{\"kind\":\"custom\",\"appid\":0,\"name\":\"{}\",\"vr\":\"{}\"}}",
+            json_escape(&g.name), if g.mode == "2d" { "2d" } else { "vr" }
+        ));
+    }
+    out.push(']');
+    out
 }
 
 // ---------------------------------------------------------------- custom games
@@ -836,7 +1019,13 @@ pub(crate) fn run_checks() -> Vec<CheckResult> {
     let has_gpu = ["NVIDIA", "AMD", "ATI", "Intel"].iter().any(|v| gpu_line.contains(v));
     push("GPU", has_gpu, gpu_line);
 
-    push("Steam", which("steam").is_some() || !steam_roots(&cfg).is_empty(), "native (non-Flatpak) Steam is recommended — its Proton runs your Windows VR games under WiVRn".into());
+    let flavour = detect_steam_flavour(&cfg);
+    push("Steam", flavour != SteamFlavour::None,
+        match flavour {
+            SteamFlavour::Flatpak => "Flatpak Steam — your games live here, VRDoctor launches through `flatpak run com.valvesoftware.Steam` and will not install a duplicate native Steam".into(),
+            SteamFlavour::Native => "native Steam — VRDoctor launches through the `steam` binary".into(),
+            SteamFlavour::None => "not found — run: vrdoctor setup".into(),
+        });
     push("adb (Android tools)", which("adb").is_some(), "needed for USB detection / sideloading the WiVRn or ALVR client".into());
     push("Avahi (mDNS)", is_running("avahi-daemon") || which("avahi-daemon").is_some(), "WiVRn discovery needs avahi-daemon running + UDP 5353 open".into());
     push("PipeWire", is_running("pipewire") || which("pipewire").is_some(), "audio on Linux VR goes through PipeWire".into());
@@ -887,7 +1076,7 @@ fn doctor() -> i32 {
 
 // ---------------------------------------------------------------- setup
 
-pub(crate) fn setup_plan(distro: &Distro) -> Vec<String> { setup_plan_for_family(&distro.family) }
+pub(crate) fn setup_plan(distro: &Distro) -> Vec<String> { install_plan(&distro.family) }
 
 /// The install plan for a chosen distro family — the installer asks the user
 /// to pick Arch or Fedora, then installs accordingly using this plan.
@@ -936,7 +1125,7 @@ pub(crate) fn run_installer_terminal(family: &Family) -> Result<String, String> 
     fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
     let script = cache.join("install-backend.sh");
     let mut body = String::from("#!/usr/bin/env bash\nset -x\n# VRDoctor backend installer\n");
-    for line in setup_plan_for_family(family) {
+    for line in install_plan(family) {
         let t = line.trim();
         if t.starts_with('#') { body.push_str(&format!("# {}\n", &t[1..])); } else { body.push_str(t); body.push('\n'); }
     }
@@ -1045,10 +1234,10 @@ fn apply_vr_env(cmd: &mut Command, backend: &str) {
 
 pub(crate) fn launch_steam_appid(appid: u64, backend: &str) -> Result<String, String> {
     let msg = start_backend(backend);
-    let mut cmd = Command::new("steam");
-    cmd.args(["-applaunch", &appid.to_string()]);
+    let flavour = detect_steam_flavour(&load_config());
+    let mut cmd = steam_launch_command(flavour, appid);
     apply_vr_env(&mut cmd, backend);
-    cmd.spawn().map(|_| format!("{msg}\nLaunched Steam AppID {appid}. Confirm the {backend} client is connected in the headset."))
+    cmd.spawn().map(|_| format!("{msg}\nLaunched Steam AppID {appid} via {}. Confirm the {backend} client is connected in the headset.", flavour.label()))
         .map_err(|e| format!("Failed to launch Steam: {e}"))
 }
 
@@ -1330,8 +1519,9 @@ pub(crate) fn start_bar() -> String {
 /// Launch a Steam game flat, for the big screen in VR.
 pub(crate) fn launch_steam_2d(appid: u64, backend: &str) -> Result<String, String> {
     let msg = format!("{}\n{}\n{}", start_backend(backend), start_overlay(), start_bar());
-    Command::new("steam").args(["-applaunch", &appid.to_string()]).spawn()
-        .map(|_| format!("{msg}\nLaunched Steam AppID {appid} in 2D mode — it will appear on the desktop panel / big screen in VR."))
+    let flavour = detect_steam_flavour(&load_config());
+    steam_launch_command(flavour, appid).spawn()
+        .map(|_| format!("{msg}\nLaunched Steam AppID {appid} in 2D mode via {} — it will appear on the desktop panel / big screen in VR.", flavour.label()))
         .map_err(|e| format!("Failed to launch Steam: {e}"))
 }
 
@@ -1653,11 +1843,11 @@ fn install_cli(args: &[String]) {
     };
     let apply = args.iter().any(|a| a == "--apply");
     println!("VRDoctor installer — installing for {:?}{}\n", family, if apply { "" } else { " (dry run)" });
-    for step in setup_plan_for_family(&family) { println!("  {step}"); }
+    for step in install_plan(&family) { println!("  {step}"); }
     println!("\nOn the Quest 3 itself (one-time):");
     for step in quest_setup_steps() { println!("  {step}"); }
     if !apply { println!("\nDry run only. Re-run with --apply, or use the GUI installer: vrdoctor installer"); return; }
-    for step in setup_plan_for_family(&family) {
+    for step in install_plan(&family) {
         let cmd = step.trim();
         if cmd.is_empty() || cmd.starts_with('#') { continue; }
         println!("\n$ {cmd}");
@@ -1667,9 +1857,79 @@ fn install_cli(args: &[String]) {
             Err(e) => println!("  failed: {e}"),
         }
     }
+    // If the user runs Flatpak Steam, make sure its sandbox can see WiVRn.
+    if detect_steam_flavour(&load_config()) == SteamFlavour::Flatpak {
+        match fix_flatpak_steam_visibility() { Ok(m) => println!("\nFlatpak Steam ↔ WiVRn:\n{m}"), Err(e) => println!("\nFlatpak Steam ↔ WiVRn: {e}") }
+    }
+    // Register the in-headset VR UI so WiVRn lists "VRDoctor VR".
+    match register_vr_desktop() { Ok(p) => println!("\nWiVRn launcher entry: {}", p.display()), Err(e) => println!("\nWiVRn launcher entry: could not write ({e})") }
     let _ = mark_installed();
     let _ = save_default_config();
     println!("\nMarked as installed. Run: vrdoctor doctor");
+}
+
+// ------------------------------------------------------- in-headset VR UI
+
+/// ~/.local/share/applications (or $XDG_DATA_HOME/applications).
+fn applications_dir() -> PathBuf {
+    env::var_os("XDG_DATA_HOME").map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share"))
+        .join("applications")
+}
+
+/// The vrdoctor-vr binary sitting next to this executable, if present.
+pub(crate) fn vr_binary_path() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let cand = exe.with_file_name("vrdoctor-vr");
+    if cand.is_file() { Some(cand) } else { None }
+}
+
+/// The .desktop entry WiVRn's in-headset launcher picks up: any desktop
+/// file whose Categories contain X-WiVRn-VR is listed as a VR app.
+fn vr_desktop_entry(exec: &str) -> String {
+    format!("[Desktop Entry]\nType=Application\nName=VRDoctor VR\nComment=Your VRDoctor library in VR — pick a game with your controllers\nExec={exec}\nIcon=vrdoctor\nTerminal=false\nCategories=Game;X-WiVRn-VR;\n")
+}
+
+/// Write/refresh ~/.local/share/applications/vrdoctor-vr.desktop so
+/// WiVRn offers "VRDoctor VR" in its launcher. Inside an AppImage the
+/// entry points back at the AppImage (`…AppImage vr`), because the
+/// mounted binary path is temporary; a system install points straight
+/// at the vrdoctor-vr binary.
+pub(crate) fn register_vr_desktop() -> std::io::Result<PathBuf> {
+    let exec = match env::var("APPIMAGE") {
+        Ok(p) if !p.is_empty() => format!("\"{p}\" vr"),
+        _ => match vr_binary_path() {
+            Some(p) => format!("\"{}\"", p.display()),
+            None => "vrdoctor-vr".to_string(),
+        },
+    };
+    let dir = applications_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("vrdoctor-vr.desktop");
+    fs::write(&path, vr_desktop_entry(&exec))?;
+    Ok(path)
+}
+
+fn cmd_vr(args: &[String]) {
+    let register_only = args.iter().any(|a| a == "--register-only");
+    match register_vr_desktop() {
+        Ok(p) => println!("WiVRn launcher entry written: {}", p.display()),
+        Err(e) => {
+            eprintln!("Could not write the WiVRn launcher entry: {e}");
+            if register_only { std::process::exit(1); }
+        }
+    }
+    if register_only { return; }
+    let Some(bin) = vr_binary_path() else {
+        eprintln!("vrdoctor-vr was not found next to this executable. It ships with VRDoctor — reinstall, or use the AppImage (which bundles it).");
+        std::process::exit(1);
+    };
+    // Forward extra args (e.g. --probe, --frames N) to the VR binary.
+    let forward: Vec<&String> = args.iter().filter(|a| *a != "--register-only").collect();
+    use std::os::unix::process::CommandExt;
+    let err = Command::new(&bin).args(&forward).exec();
+    eprintln!("Failed to start vrdoctor-vr: {err}");
+    std::process::exit(1);
 }
 
 fn remove_game_cli(args: &[String]) {
@@ -1700,7 +1960,12 @@ USAGE:
   vrdoctor play2d [--game <custom-name|appid|steam-name|path>]   Play a 2D game on the big screen in VR
   vrdoctor devices                  Detect Quest 3 over USB (adb)
   vrdoctor fix-openvr [--undo]      Stop a (broken) SteamVR from hijacking OpenVR games — route them to WiVRn/xrizer
+  vrdoctor fix-steam              Let Flatpak Steam see WiVRn (sandbox overrides + runtime symlink) so games open in the headset, not flat on the monitor
   vrdoctor list-games [--online]    Steam games grouped VR / VR+2D / 2D + custom (non-store) games
+  vrdoctor list-games --json        The same list as JSON (used by vrdoctor-vr, the in-headset UI)
+  vrdoctor vr [--register-only]     Open the VRDoctor library inside the headset (a real OpenXR app
+                                    that WiVRn lists under "VRDoctor VR"); --register-only only
+                                    refreshes its WiVRn launcher entry (~/.local/share/applications)
   vrdoctor classify --game <appid|name> [--offline]   Is this Steam game VR or 2D? (auto-detection)
   vrdoctor add-game --name "My Game" --path /path/to/game [--args "..."] [--workdir /dir] [--backend wivrn|alvr|steamlink] [--proton /path/to/proton] [--mode vr|2d]
   vrdoctor remove-game --name "My Game"
@@ -1752,6 +2017,10 @@ fn main() {
         }
         "list-games" | "games" => {
             let cfg = load_config();
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", games_json(&list_games(&cfg), &load_custom_games()));
+                return;
+            }
             let online = args.iter().any(|a| a == "--online");
             let games = list_games(&cfg);
             println!("Steam games{}:", if online { " (checking Steam online for unknowns)" } else { "" });
@@ -1790,6 +2059,10 @@ fn main() {
             let res = if args.iter().any(|a| a == "--undo") { fix_openvr_undo() } else { fix_openvr() };
             match res { Ok(m) => println!("{m}"), Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
         }
+        "fix-steam" => {
+            match fix_flatpak_steam_visibility() { Ok(m) => println!("{m}"), Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
+        }
+        "vr" => cmd_vr(&args[1..]),
         "add-game" => add_game_cli(&args[1..]),
         "remove-game" => remove_game_cli(&args[1..]),
         "launch" | "play" => launch(&args[1..]),
@@ -1988,5 +2261,59 @@ mod tests {
         fs::write(&p, [0x7f, b'E', b'L', b'F', 2, 1]).unwrap();
         assert_eq!(detect_kind(&p), GameKind::NativeExecutable);
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn games_json_shape_and_escaping() {
+        // 450390 (The Lab) is a known VR-only title; 999999999 is unknown
+        // offline (its install dir does not exist, so no VR markers).
+        let steam = vec![
+            Game { appid: 450390, name: "The \"Lab\" \\ VR".into(), library: PathBuf::new(), install_dir: PathBuf::new() },
+            Game { appid: 999999999, name: "Mystery Game".into(), library: PathBuf::new(), install_dir: PathBuf::new() },
+        ];
+        let custom = vec![
+            CustomGame { name: "Flat Friend".into(), mode: "2d".into(), ..Default::default() },
+            CustomGame { name: "Homebrew VR".into(), mode: String::new(), ..Default::default() },
+        ];
+        let json = games_json(&steam, &custom);
+        assert_eq!(json, concat!(
+            "[",
+            "{\"kind\":\"steam\",\"appid\":450390,\"name\":\"The \\\"Lab\\\" \\\\ VR\",\"vr\":\"vr\"},",
+            "{\"kind\":\"steam\",\"appid\":999999999,\"name\":\"Mystery Game\",\"vr\":\"unknown\"},",
+            "{\"kind\":\"custom\",\"appid\":0,\"name\":\"Flat Friend\",\"vr\":\"2d\"},",
+            "{\"kind\":\"custom\",\"appid\":0,\"name\":\"Homebrew VR\",\"vr\":\"vr\"}",
+            "]"
+        ));
+        assert_eq!(games_json(&[], &[]), "[]");
+    }
+
+    #[test]
+    fn vr_desktop_entry_has_wivrn_category() {
+        let entry = vr_desktop_entry("\"/opt/VRDoctor.AppImage\" vr");
+        assert!(entry.contains("Name=VRDoctor VR"));
+        assert!(entry.contains("Categories=Game;X-WiVRn-VR;"));
+        assert!(entry.contains("Exec=\"/opt/VRDoctor.AppImage\" vr"));
+    }
+
+    #[test]
+    fn steam_flavour_prefers_library_owner() {
+        // The user's exact case: Flatpak Steam has the games, native was
+        // freshly installed by VRDoctor and has none → Flatpak wins.
+        assert_eq!(pick_steam_flavour(true, true, 20, 0), SteamFlavour::Flatpak);
+        assert_eq!(pick_steam_flavour(false, true, 0, 5), SteamFlavour::Native);
+        assert_eq!(pick_steam_flavour(true, false, 0, 0), SteamFlavour::Flatpak);
+        assert_eq!(pick_steam_flavour(false, true, 0, 0), SteamFlavour::Native);
+        assert_eq!(pick_steam_flavour(false, false, 0, 0), SteamFlavour::None);
+        // More games wins when both libraries are populated.
+        assert_eq!(pick_steam_flavour(true, true, 3, 9), SteamFlavour::Native);
+        assert_eq!(pick_steam_flavour(true, true, 9, 3), SteamFlavour::Flatpak);
+    }
+
+    #[test]
+    fn steam_launch_command_uses_flatpak_run() {
+        let flat = format!("{:?}", steam_launch_command(SteamFlavour::Flatpak, 275850));
+        assert!(flat.contains("flatpak") && flat.contains("com.valvesoftware.Steam") && flat.contains("275850"), "{flat}");
+        let nat = format!("{:?}", steam_launch_command(SteamFlavour::Native, 275850));
+        assert!(nat.contains("\"steam\"") && nat.contains("275850"), "{nat}");
     }
 }
