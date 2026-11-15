@@ -1291,6 +1291,12 @@ pub(crate) fn run_checks() -> Vec<CheckResult> {
     // Zero custom games is a perfectly normal state, not a failure —
     // this check is informational (the count + where they're stored).
     push("Custom games", true, format!("{} custom (non-store) game(s) in {}", custom.len(), custom_games_path().display()));
+    // Informational: umu is the recommended route for Windows games, but
+    // its absence isn't an error — launches fall back to a bare Proton call.
+    push("umu-launcher", true, match which("umu-run") {
+        Some(p) => format!("{} — Windows games run inside the Steam runtime container", p.display()),
+        None => "not installed — Windows games use a bare Proton call; installing umu-launcher (Arch: sudo pacman -S umu-launcher) fixes games that fail to start".to_string(),
+    });
 
     let quests = detect_quest();
     if quests.is_empty() {
@@ -1325,7 +1331,7 @@ pub(crate) fn setup_plan(distro: &Distro) -> Vec<String> { install_plan(&distro.
 pub(crate) fn setup_plan_for_family(family: &Family) -> Vec<String> {
     match family {
         Family::Arch => vec![
-            "sudo pacman -S --needed steam android-tools avahi pipewire pipewire-pulse vulkan-headers libva-mesa-driver git base-devel".into(),
+            "sudo pacman -S --needed steam android-tools avahi pipewire pipewire-pulse vulkan-headers libva-mesa-driver git base-devel umu-launcher".into(),
             "# WiVRn (native, preferred): AUR package wivrn-dashboard  — e.g. with yay:".into(),
             "yay -S wivrn-dashboard".into(),
             "# …or distro-agnostic Flatpak (bundles xrizer + OpenComposite):".into(),
@@ -1338,6 +1344,7 @@ pub(crate) fn setup_plan_for_family(family: &Family) -> Vec<String> {
             "# Enable RPM Fusion (needed for Steam + full codecs):".into(),
             "sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm".into(),
             "sudo dnf install steam android-tools avahi pipewire vulkan-headers libva-devel wivrn".into(),
+            "# Recommended for Windows games: umu-launcher (runs Proton in the Steam runtime container) — see https://github.com/Open-Wine-Components/umu-launcher".into(),
             "sudo systemctl enable --now avahi-daemon".into(),
             "# Optional, for 2D games / desktop in VR: WayVR — see https://github.com/galister/WayVR (not in Fedora repos yet)".into(),
             "# Optional fallback: install ALVR streamer tarball from https://github.com/alvr-org/ALVR/releases".into(),
@@ -1484,18 +1491,39 @@ pub(crate) fn launch_steam_appid(appid: u64, backend: &str) -> Result<String, St
 }
 
 /// Build a Proton/Wine command for a Windows file (.exe / .bat / .msi).
-fn windows_command(game: &CustomGame, cfg: &Config, kind: GameKind, args: &[String]) -> Result<Command, String> {
+/// The directory a Proton installation lives in (the parent of its
+/// `proton` script) — what umu-launcher's PROTONPATH expects.
+fn proton_dir_of(proton_script: &Path) -> PathBuf {
+    proton_script.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf()).unwrap_or_else(|| proton_script.to_path_buf())
+}
+
+/// Build a Proton/Wine command for a Windows file (.exe / .bat / .msi),
+/// plus a short note naming the route taken ("" when nothing noteworthy).
+fn windows_command(game: &CustomGame, cfg: &Config, kind: GameKind, args: &[String]) -> Result<(Command, String), String> {
     let proton = if !game.proton.is_empty() { Some(PathBuf::from(&game.proton)) } else { find_proton(cfg) };
     if let Some(proton) = proton {
         let compat = config_dir().join("compatdata").join(sanitize_name(&game.name));
         let _ = fs::create_dir_all(&compat);
+        // Preferred route: umu-launcher, which runs Proton inside the
+        // same runtime container Steam uses. A bare `proton run` skips
+        // that container, and some games then fail before they start —
+        // proven on real hardware with SUPERHOT VR: bare run died with
+        // Unity's "Failed to initialize graphics", the umu run worked.
+        if let Some(umu) = which("umu-run") {
+            let mut cmd = Command::new(umu);
+            cmd.arg(&game.path).args(args);
+            cmd.env("GAMEID", sanitize_name(&game.name));
+            cmd.env("WINEPREFIX", &compat);
+            cmd.env("PROTONPATH", proton_dir_of(&proton));
+            return Ok((cmd, "via umu-launcher (Steam runtime container)".to_string()));
+        }
         let mut cmd = Command::new(&proton);
         cmd.arg("run").arg(&game.path).args(args);
         cmd.env("STEAM_COMPAT_DATA_PATH", &compat);
         let root = steam_roots(cfg).into_iter().next()
             .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share/Steam"));
         cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", root);
-        return Ok(cmd);
+        return Ok((cmd, String::new()));
     }
     if let Some(wine) = which("wine") {
         let mut cmd = Command::new(wine);
@@ -1504,7 +1532,7 @@ fn windows_command(game: &CustomGame, cfg: &Config, kind: GameKind, args: &[Stri
             GameKind::WindowsInstaller => { cmd.arg("msiexec").arg("/i").arg(&game.path).args(args); }
             _ => { cmd.arg(&game.path).args(args); }
         }
-        return Ok(cmd);
+        return Ok((cmd, String::new()));
     }
     Err(format!("'{}' is a Windows file but no Proton or Wine was found. Install the game once via Steam (Add a Non-Steam Game) so Proton exists, set a Proton path in the GUI/CLI, or install Wine.", game.name))
 }
@@ -1602,8 +1630,13 @@ fn launch_custom_game_impl(game: &CustomGame, cfg: &Config, mode2d: bool) -> Res
         format!("{}\n{}\n{}", start_backend(&backend), start_overlay(), start_bar())
     } else { start_backend(&backend) };
     let args = split_args(&game.args);
+    let mut route_note = String::new();
     let mut cmd = match kind {
-        GameKind::WindowsExe | GameKind::WindowsBatch | GameKind::WindowsInstaller => windows_command(game, cfg, kind, &args)?,
+        GameKind::WindowsExe | GameKind::WindowsBatch | GameKind::WindowsInstaller => {
+            let (c, note) = windows_command(game, cfg, kind, &args)?;
+            route_note = note;
+            c
+        }
         GameKind::ShellScript | GameKind::Python | GameKind::Perl | GameKind::Ruby | GameKind::Node | GameKind::Jar | GameKind::Love => interpreter_command(game, kind, &args)?,
         GameKind::DesktopEntry => {
             let content = fs::read_to_string(&game.path).map_err(|e| format!("Could not read {}: {e}", game.path.display()))?;
@@ -1624,10 +1657,13 @@ fn launch_custom_game_impl(game: &CustomGame, cfg: &Config, mode2d: bool) -> Res
     if let Some(w) = &game.workdir { cmd.current_dir(w); }
     else if let Some(parent) = game.path.parent() { if kind != GameKind::DesktopEntry { cmd.current_dir(parent); } }
     if !mode2d { apply_vr_env(&mut cmd, &backend); }
-    let how = match kind {
-        GameKind::WindowsInstaller => " (installer — follow its setup, then add the installed game)",
-        GameKind::DesktopEntry => " (via its .desktop Exec line)",
-        _ => "",
+    let how = {
+        let base = match kind {
+            GameKind::WindowsInstaller => " (installer — follow its setup, then add the installed game)",
+            GameKind::DesktopEntry => " (via its .desktop Exec line)",
+            _ => "",
+        };
+        if route_note.is_empty() { base.to_string() } else { format!("{base} ({route_note})") }
     };
     let screen = if mode2d { " on the big screen in VR (2D mode — look at the desktop panel; the VRDoctor bar sits under it)" } else { "" };
     cmd.spawn().map(|_| format!("{msg}\nLaunched custom game '{}' ({:?}, {}) via {backend}{how}{screen}.", game.name, kind, game.path.display()))
@@ -2591,6 +2627,12 @@ mod tests {
         assert!(is_helper_exe(&game_dir.join("UnityCrashHandler64.exe")));
         assert!(!is_helper_exe(&game_dir.join("SUPERHOT_VR.exe")));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn proton_dir_is_the_scripts_parent() {
+        assert_eq!(proton_dir_of(Path::new("/steam/common/Proton 9.0 (Beta)/proton")), PathBuf::from("/steam/common/Proton 9.0 (Beta)"));
+        assert_eq!(proton_dir_of(Path::new("proton")), PathBuf::from("proton"));
     }
 
     #[test]

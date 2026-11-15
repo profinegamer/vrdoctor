@@ -195,7 +195,7 @@ Add **any** game, no store required. Point VRDoctor at the game file, an archive
 | `.py`, `.pl`, `.rb`, `.js` | python3 / perl / ruby / node (must be installed) |
 | `.jar` | `java -jar` (Java runtime must be installed) |
 | `.love` | LÖVE runtime |
-| `.exe` / `.com`, `.bat` / `.cmd` | **Proton** (auto-detected from Steam, per-game compat data under `~/.config/vrdoctor/compatdata/`) or **Wine** fallback; specific Proton can be set per game |
+| `.exe` / `.com`, `.bat` / `.cmd` | **Proton** (auto-detected from Steam, per-game compat data under `~/.config/vrdoctor/compatdata/`) or **Wine** fallback; specific Proton can be set per game. When **umu-launcher** is installed, games run through it — Proton inside the same runtime container Steam uses (a bare `proton run` skips that container, and some games, e.g. SUPERHOT VR, then fail with "Failed to initialize graphics") |
 | `.msi` | Installer via Proton/Wine `msiexec` — install, then add the installed game |
 | `.desktop` | Runs its `Exec=` line |
 | `.apk` | **Sideloaded onto the Quest 3** via adb (it's a native Quest game, not streamed) |
