@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Build VRDoctor-x86_64.AppImage.
 #
-# The AppImage contains the vrdoctor binary plus the X11/Wayland runtime
-# libraries it dlopens (xkbcommon, wayland-client, xcb, …) so it runs on
-# Arch and Fedora desktops alike. On first run (no ~/.config/vrdoctor/
+# The AppImage contains the vrdoctor binary plus exactly two bundled
+# libraries: libxkbcommon and libxkbcommon-x11. Those are self-contained
+# keyboard libraries that winit dlopens by name and that are NOT present
+# on every system (a bare system panics with "Library libxkbcommon-x11.so
+# could not be loaded"). Everything else — libX11, libxcb, libwayland,
+# libGL/EGL — is the host's own graphics stack, which must match the
+# host's GPU driver and compositor: bundling foreign copies of those and
+# prepending them via LD_LIBRARY_PATH broke window creation on real
+# machines in v0.7.0 (glutin: "Found no glutin configs matching the
+# template" / "provided display handle is not supported"). On first run (no ~/.config/vrdoctor/
 # installed-v1 marker) the app opens the VRDoctor installer, which asks
 # "Arch or Fedora?" and installs the VR backend accordingly. Later runs
 # open the main GUI. CLI use: ./VRDoctor-x86_64.AppImage doctor | install …
@@ -27,13 +34,16 @@ if [ ! -f vrdoctor.png ]; then python3 make-icon.py; fi
 install -m644 vrdoctor.png "$APPDIR/vrdoctor.png"
 install -m644 vrdoctor.png "$APPDIR/usr/share/icons/hicolor/512x512/apps/vrdoctor.png"
 
-# Runtime libraries the binary dlopens at runtime (not shown by ldd).
-for lib in libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1 libxkbfile.so.1 \
-           libwayland-client.so.0 libffi.so.8 libxcb.so.1 libX11.so.6 libXext.so.6 \
-           libXcursor.so.1 libXfixes.so.3 libXi.so.6 libXrandr.so.2; do
-  for d in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib; do
+# Bundle ONLY the xkbcommon pair (see the header comment). The build
+# cache's libs/ dir is a fallback source on machines where the -x11
+# library is not installed system-wide.
+LIBCACHE="${XDG_CACHE_HOME:-$HOME/.cache}/vrdoctor-build/libs"
+for lib in libxkbcommon.so.0 libxkbcommon-x11.so.0; do
+  for d in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib "$LIBCACHE"; do
     if [ -e "$d/$lib" ]; then cp -L "$d/$lib" "$APPDIR/usr/lib/" && break; fi
   done
+  # winit's xkbcommon-dl may dlopen the unversioned name too.
+  (cd "$APPDIR/usr/lib" && ln -sf "$lib" "${lib%.0}")
 done
 
 cat > "$APPDIR/AppRun" <<'EOF'
