@@ -1314,18 +1314,22 @@ struct Palette {
     floor_near: (f32, f32, f32), floor_far: (f32, f32, f32),
     glow: (f32, f32, f32), glow_pos: (f32, f32), glow_strength: f32,
     panel_add: f32, stars: bool,
+    /// Sun/moon disc: (radius, colour added at the disc).
+    disc: Option<(f32, (f32, f32, f32))>,
+    /// Distant ridge/hills silhouette colour just above the horizon.
+    ridge: Option<(f32, f32, f32)>,
 }
 
 fn palette(theme: &str) -> Palette {
     match theme {
-        "meadow" => Palette { sky_top: (0.55, 0.78, 0.98), sky_horizon: (0.92, 0.98, 0.90), floor_near: (0.62, 0.82, 0.52), floor_far: (0.30, 0.55, 0.30), glow: (0.25, 0.20, 0.05), glow_pos: (0.5, 0.34), glow_strength: 3.5, panel_add: 0.10, stars: false },
-        "ocean" => Palette { sky_top: (0.45, 0.75, 0.95), sky_horizon: (0.85, 0.97, 0.98), floor_near: (0.45, 0.80, 0.85), floor_far: (0.10, 0.45, 0.65), glow: (0.20, 0.18, 0.10), glow_pos: (0.5, 0.36), glow_strength: 3.5, panel_add: 0.10, stars: false },
-        "sunset" => Palette { sky_top: (0.45, 0.35, 0.65), sky_horizon: (1.05, 0.55, 0.30), floor_near: (0.55, 0.38, 0.35), floor_far: (0.25, 0.16, 0.22), glow: (0.45, 0.22, 0.02), glow_pos: (0.5, 0.48), glow_strength: 2.2, panel_add: 0.06, stars: false },
-        "night" => Palette { sky_top: (0.04, 0.07, 0.20), sky_horizon: (0.16, 0.20, 0.42), floor_near: (0.14, 0.17, 0.28), floor_far: (0.05, 0.06, 0.12), glow: (0.18, 0.20, 0.28), glow_pos: (0.72, 0.22), glow_strength: 5.0, panel_add: 0.08, stars: true },
-        "studio" => Palette { sky_top: (0.97, 0.97, 0.98), sky_horizon: (1.0, 1.0, 1.0), floor_near: (0.93, 0.93, 0.94), floor_far: (0.78, 0.78, 0.80), glow: (0.06, 0.06, 0.06), glow_pos: (0.5, 0.30), glow_strength: 3.0, panel_add: -0.05, stars: false },
-        "cozy" => Palette { sky_top: (0.92, 0.72, 0.52), sky_horizon: (1.02, 0.85, 0.62), floor_near: (0.62, 0.44, 0.30), floor_far: (0.36, 0.24, 0.16), glow: (0.30, 0.18, 0.04), glow_pos: (0.5, 0.40), glow_strength: 3.0, panel_add: 0.07, stars: false },
+        "meadow" => Palette { sky_top: (0.55, 0.78, 0.98), sky_horizon: (0.92, 0.98, 0.90), floor_near: (0.62, 0.82, 0.52), floor_far: (0.30, 0.55, 0.30), glow: (0.25, 0.20, 0.05), glow_pos: (0.5, 0.34), glow_strength: 3.5, panel_add: -0.04, stars: false, disc: Some((0.14, (0.32, 0.28, 0.10))), ridge: Some((0.16, 0.32, 0.16)) },
+        "ocean" => Palette { sky_top: (0.45, 0.75, 0.95), sky_horizon: (0.85, 0.97, 0.98), floor_near: (0.45, 0.80, 0.85), floor_far: (0.10, 0.45, 0.65), glow: (0.20, 0.18, 0.10), glow_pos: (0.5, 0.36), glow_strength: 3.5, panel_add: -0.06, stars: false, disc: Some((0.15, (0.30, 0.26, 0.12))), ridge: Some((0.08, 0.30, 0.42)) },
+        "sunset" => Palette { sky_top: (0.45, 0.35, 0.65), sky_horizon: (1.05, 0.55, 0.30), floor_near: (0.55, 0.38, 0.35), floor_far: (0.25, 0.16, 0.22), glow: (0.45, 0.22, 0.02), glow_pos: (0.5, 0.48), glow_strength: 2.2, panel_add: 0.06, stars: false, disc: Some((0.24, (0.55, 0.25, 0.02))), ridge: Some((0.30, 0.14, 0.24)) },
+        "night" => Palette { sky_top: (0.04, 0.07, 0.20), sky_horizon: (0.16, 0.20, 0.42), floor_near: (0.14, 0.17, 0.28), floor_far: (0.05, 0.06, 0.12), glow: (0.18, 0.20, 0.28), glow_pos: (0.72, 0.22), glow_strength: 5.0, panel_add: 0.08, stars: true, disc: Some((0.10, (0.35, 0.38, 0.45))), ridge: Some((0.05, 0.07, 0.16)) },
+        "studio" => Palette { sky_top: (0.97, 0.97, 0.98), sky_horizon: (1.0, 1.0, 1.0), floor_near: (0.93, 0.93, 0.94), floor_far: (0.78, 0.78, 0.80), glow: (0.06, 0.06, 0.06), glow_pos: (0.5, 0.30), glow_strength: 3.0, panel_add: -0.05, stars: false, disc: None, ridge: None },
+        "cozy" => Palette { sky_top: (0.92, 0.72, 0.52), sky_horizon: (1.02, 0.85, 0.62), floor_near: (0.62, 0.44, 0.30), floor_far: (0.36, 0.24, 0.16), glow: (0.30, 0.18, 0.04), glow_pos: (0.5, 0.40), glow_strength: 3.0, panel_add: 0.05, stars: false, disc: Some((0.18, (0.30, 0.18, 0.03))), ridge: None },
         // "dawn" — the default: bright, calm, Frame-like but lighter.
-        _ => Palette { sky_top: (0.80, 0.88, 0.97), sky_horizon: (1.0, 0.99, 0.94), floor_near: (0.88, 0.90, 0.93), floor_far: (0.68, 0.71, 0.76), glow: (0.22, 0.16, 0.05), glow_pos: (0.5, 0.38), glow_strength: 3.5, panel_add: 0.10, stars: false },
+        _ => Palette { sky_top: (0.80, 0.88, 0.97), sky_horizon: (1.0, 0.99, 0.94), floor_near: (0.88, 0.90, 0.93), floor_far: (0.68, 0.71, 0.76), glow: (0.17, 0.12, 0.04), glow_pos: (0.5, 0.38), glow_strength: 3.5, panel_add: -0.04, stars: false, disc: Some((0.16, (0.20, 0.15, 0.05))), ridge: None },
     }
 }
 
@@ -1364,22 +1368,49 @@ pub(crate) fn render_panorama_theme(path: &Path, theme: &str, brightness: f32) -
                 let dx = (u - pal.glow_pos.0) * 2.0; let dy = (v - pal.glow_pos.1) * 2.6;
                 let glow = (-(dx * dx + dy * dy) * pal.glow_strength).exp();
                 r += glow * pal.glow.0; g += glow * pal.glow.1; b += glow * pal.glow.2;
+                // Crisp sun / moon disc inside the glow.
+                if let Some((radius, dc)) = pal.disc {
+                    let d = (dx * dx + dy * dy).sqrt();
+                    let edge = ((radius - d) / (radius * 0.35)).clamp(0.0, 1.0);
+                    r += dc.0 * edge; g += dc.1 * edge; b += dc.2 * edge;
+                }
                 if pal.stars && is_star(x, y) { r += 0.55; g += 0.55; b += 0.60; }
-                // Faint floating panels.
+                // Distant ridge silhouette just above the horizon.
+                if let Some(rc) = pal.ridge {
+                    let ridge_y = 0.475 + 0.028 * (u * 18.85 + 1.7).sin() + 0.014 * (u * 50.27 + 0.4).sin();
+                    if v > ridge_y {
+                        let m = ((v - ridge_y) / 0.015).clamp(0.0, 1.0) * 0.7;
+                        r += (rc.0 - r) * m; g += (rc.1 - g) * m; b += (rc.2 - b) * m;
+                    }
+                }
+                // Faint floating panels, with a brighter rim so they read as panels.
                 for (x0, x1, y0, y1) in panels {
                     if u > x0 && u < x1 && v > y0 && v < y1 { r += pal.panel_add; g += pal.panel_add; b += pal.panel_add; }
+                    else if u > x0 - 0.0035 && u < x1 + 0.0035 && v > y0 - 0.0035 && v < y1 + 0.0035 {
+                        let e = pal.panel_add * 2.2; r += e; g += e; b += e;
+                    }
                 }
             } else {
                 let t = (v - 0.54) / 0.46;
                 let c = lerp(pal.floor_near, pal.floor_far, t);
                 r = c.0; g = c.1; b = c.2;
+                // Soft glow reflection (water / polished floor).
+                if pal.ridge.is_some() {
+                    let rx = (u - pal.glow_pos.0) * 2.0;
+                    let refl = (-rx * rx * 9.0).exp() * (1.0 - t) * 0.12;
+                    r += refl * pal.glow.0 * 2.0; g += refl * pal.glow.1 * 2.0; b += refl * pal.glow.2 * 2.0;
+                }
                 // Subtle radial guides on the floor.
                 let dx = (u - 0.5) * 2.0;
                 let ring = ((dx * dx * 4.0 + t * t * 9.0).sqrt() * 6.0).fract();
                 if ring < 0.06 { r -= 0.03; g -= 0.03; b -= 0.03; }
             }
+            // Ordered-noise dither: smooths gradient banding in the headset.
+            let mut hn = (x as u64).wrapping_mul(0x85EBCA6B) ^ (y as u64).wrapping_mul(0x27D4EB2D);
+            hn ^= hn >> 15; hn = hn.wrapping_mul(0x2C1B3C6D); hn ^= hn >> 12;
+            let dither = ((hn % 1024) as f32 / 1024.0 - 0.5) * 0.012;
             let i = (y * w + x) * 3;
-            px[i] = clamp(r * brightness); px[i + 1] = clamp(g * brightness); px[i + 2] = clamp(b * brightness);
+            px[i] = clamp((r + dither) * brightness); px[i + 1] = clamp((g + dither) * brightness); px[i + 2] = clamp((b + dither) * brightness);
         }
     }
     if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }

@@ -1,5 +1,5 @@
 Name:           vrdoctor
-Version:        0.5.0
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        GUI + CLI launcher for PCVR games on Meta Quest 3 via WiVRn / ALVR, with custom non-store games
 License:        MIT

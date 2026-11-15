@@ -1,5 +1,7 @@
 # VRDoctor 🩺
 
+> **🤖 Completely vibe coded.** Every line of VRDoctor — the Rust code, this README, the tests, the packaging — was written by an AI assistant (Muse) from plain-language requests. The human behind it directed the features, asked the questions, and shipped the result without writing the code by hand. Bugs are still bugs and reports are welcome — just know who (what) you're reporting them to.
+
 A Rust launcher — **GUI (dark mode by default) + full CLI** — that lets you play **PC VR games on a Meta Quest 3 from Arch or Fedora Linux**. Games run on the PC; the Quest 3 is the display, tracking, and controllers.
 
 It handles **Steam games and custom games that aren't on any store** — any local executable, script, or Windows `.exe`.

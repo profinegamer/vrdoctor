@@ -13,6 +13,81 @@ use crate::{
     HOME_THEMES, SUPPORTED_KINDS,
 };
 
+// ------------------------------------------------------------ visual theme
+
+/// VRDoctor's polished theme: deep slate surfaces, a teal "medical" accent,
+/// rounded corners and comfortable spacing — applied to the GUI, the
+/// installer and the bar so everything looks like one product.
+pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(45, 212, 191);
+
+fn polished_visuals(dark: bool) -> egui::Visuals {
+    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let round = egui::Rounding::same(9.0);
+    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open, &mut v.widgets.noninteractive] {
+        w.rounding = round;
+    }
+    v.window_rounding = egui::Rounding::same(14.0);
+    v.selection.bg_fill = ACCENT;
+    v.hyperlink_color = ACCENT;
+    if dark {
+        v.panel_fill = egui::Color32::from_rgb(13, 18, 32);
+        v.window_fill = egui::Color32::from_rgb(13, 18, 32);
+        v.extreme_bg_color = egui::Color32::from_rgb(7, 10, 18);
+        v.faint_bg_color = egui::Color32::from_rgb(24, 33, 52);
+        v.override_text_color = Some(egui::Color32::from_rgb(226, 232, 240));
+        v.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 41, 59);
+        v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(30, 41, 59);
+        v.widgets.hovered.bg_fill = egui::Color32::from_rgb(43, 58, 84);
+        v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(43, 58, 84);
+        v.widgets.active.bg_fill = egui::Color32::from_rgb(15, 118, 110);
+        v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(15, 118, 110);
+        v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(6, 24, 22));
+    } else {
+        v.panel_fill = egui::Color32::from_rgb(248, 250, 252);
+        v.window_fill = egui::Color32::from_rgb(248, 250, 252);
+        v.faint_bg_color = egui::Color32::from_rgb(226, 232, 240);
+        v.widgets.active.bg_fill = egui::Color32::from_rgb(153, 246, 228);
+        v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(153, 246, 228);
+    }
+    v
+}
+
+fn apply_polish(ctx: &egui::Context, dark: bool) {
+    ctx.set_visuals(polished_visuals(dark));
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(14.0);
+    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(23.0));
+    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.5));
+    style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.5));
+    ctx.set_style(style);
+}
+
+/// Coloured pill showing a Steam game's detected kind.
+fn badge(ui: &mut egui::Ui, sup: VrSupport) {
+    let (text, bg) = match sup {
+        VrSupport::VrOnly => (" VR ", egui::Color32::from_rgb(21, 101, 52)),
+        VrSupport::VrSupported => (" VR+2D ", egui::Color32::from_rgb(88, 28, 175)),
+        VrSupport::Flat => (" 2D ", egui::Color32::from_rgb(29, 64, 175)),
+        VrSupport::Unknown => (" ? ", egui::Color32::from_rgb(133, 77, 14)),
+    };
+    ui.label(egui::RichText::new(text).background_color(bg).color(egui::Color32::WHITE).strong().size(13.0));
+}
+
+/// A rounded card used for game rows and grouped content.
+fn card<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let r = egui::Frame::none()
+        .fill(ui.visuals().faint_bg_color)
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+        .show(ui, f);
+    ui.add_space(4.0);
+    r.inner
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Tab { Games, Doctor, AddGame, Shell, Setup }
 
@@ -42,7 +117,7 @@ impl VrDoctorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = load_config();
         let dark_mode = cfg.theme != "light"; // dark is the default
-        cc.egui_ctx.set_visuals(if dark_mode { egui::Visuals::dark() } else { egui::Visuals::light() });
+        apply_polish(&cc.egui_ctx, dark_mode);
         let backend = cfg.backend.clone();
         Self {
             steam_games: list_games(&cfg),
@@ -72,7 +147,7 @@ impl VrDoctorApp {
     }
 
     fn apply_theme(&mut self, ctx: &egui::Context) {
-        ctx.set_visuals(if self.dark_mode { egui::Visuals::dark() } else { egui::Visuals::light() });
+        apply_polish(ctx, self.dark_mode);
         self.cfg.theme = if self.dark_mode { "dark".into() } else { "light".into() };
         let _ = save_config(&self.cfg);
     }
@@ -82,7 +157,7 @@ impl eframe::App for VrDoctorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("🩺 VRDoctor");
+                ui.label(egui::RichText::new("🩺 VRDoctor").size(23.0).strong().color(ACCENT));
                 ui.label("PCVR on Meta Quest 3 — Arch & Fedora Linux");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.checkbox(&mut self.dark_mode, "🌙 Dark mode").changed() {
@@ -139,14 +214,14 @@ impl VrDoctorApp {
         let mut to_launch: Option<CustomGame> = None;
         let mut to_remove: Option<String> = None;
         for g in self.custom_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(&needle)) {
-            ui.horizontal(|ui| {
+            card(ui, |ui| { ui.horizontal(|ui| {
                 if ui.button("▶ Launch").clicked() { to_launch = Some(g.clone()); }
                 ui.vertical(|ui| {
                     ui.strong(format!("{}{}", g.name, if g.mode == "2d" { "  [2D]" } else { "" }));
                     ui.small(format!("{}{}", g.path.display(), if g.args.is_empty() { String::new() } else { format!("  {}", g.args) }));
                 });
                 if ui.button("🗑").clicked() { to_remove = Some(g.name.clone()); }
-            });
+            }); });
         }
         if let Some(g) = to_launch {
             let mut g = g;
@@ -179,12 +254,15 @@ impl VrDoctorApp {
         let mut steam_launch_2d: Option<Game> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for g in self.steam_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(&needle)) {
-                ui.horizontal(|ui| {
-                    if ui.button("▶ Launch").clicked() { steam_launch = Some(g.clone()); }
-                    if ui.button("▶ 2D").clicked() { steam_launch_2d = Some(g.clone()); }
-                    let (sup, _src) = classify_game(g, false);
-                    ui.strong(format!("[{}]", sup.label()));
-                    ui.label(format!("{}  ({})", g.name, g.appid));
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("▶ Launch").clicked() { steam_launch = Some(g.clone()); }
+                        if ui.button("▶ 2D").clicked() { steam_launch_2d = Some(g.clone()); }
+                        let (sup, _src) = classify_game(g, false);
+                        badge(ui, sup);
+                        ui.strong(&g.name);
+                        ui.small(format!("AppID {}", g.appid));
+                    });
                 });
             }
         });
@@ -348,7 +426,7 @@ impl InstallerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = load_config();
         let dark_mode = cfg.theme != "light";
-        cc.egui_ctx.set_visuals(if dark_mode { egui::Visuals::dark() } else { egui::Visuals::light() });
+        apply_polish(&cc.egui_ctx, dark_mode);
         let distro = current_distro();
         let family = match distro.family { Family::Arch | Family::Fedora => distro.family.clone(), _ => Family::Arch };
         Self { family, detected: distro.pretty, status: "Pick your distro, review the plan, then install.".into() }
@@ -358,7 +436,7 @@ impl InstallerApp {
 impl eframe::App for InstallerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("🩺 VRDoctor installer");
+            ui.label(egui::RichText::new("🩺 VRDoctor installer").size(23.0).strong().color(ACCENT));
             ui.label(format!("Detected: {}. If that's wrong, just pick the right one:", self.detected));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -418,7 +496,7 @@ pub struct BarApp {
 
 impl BarApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark()); // the bar is always dark, like Quest's
+        apply_polish(&cc.egui_ctx, true); // the bar is always dark, like Quest's
         Self { battery: quest_battery(), frames: 0 }
     }
 }
@@ -441,14 +519,15 @@ impl eframe::App for BarApp {
             let clock = capture("date", &["+%H:%M"]).map(|s| s.trim().to_string()).unwrap_or_default();
             let date = capture("date", &["+%a %d %b"]).map(|s| s.trim().to_string()).unwrap_or_default();
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(30, 32, 36))
+                .fill(egui::Color32::from_rgb(17, 24, 39))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 212, 191)))
                 .rounding(egui::Rounding::same(28.0))
                 .inner_margin(egui::Margin::symmetric(18.0, 8.0))
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
-                        ui.strong("🩺 VRDoctor");
+                        ui.label(egui::RichText::new("🩺 VRDoctor").strong().color(ACCENT).size(16.0));
                         ui.separator();
-                        ui.label(format!("🕐 {clock}"));
+                        ui.label(egui::RichText::new(format!("🕐 {clock}")).strong().size(19.0));
                         ui.small(date);
                         ui.separator();
                         ui.label(if crate::which("wivrn-server").is_some() || crate::flatpak_installed("io.github.wivrn.wivrn") { "📶 WiVRn ready" } else { "📶 WiVRn not installed" });
