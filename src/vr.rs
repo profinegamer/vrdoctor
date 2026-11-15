@@ -157,10 +157,97 @@ fn config_base() -> PathBuf {
     env::var("XDG_CONFIG_HOME").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".config"))
 }
+fn config_file() -> PathBuf { config_base().join("vrdoctor/config.conf") }
 
-/// The installed VR Home panorama (dawn preferred), if any.
+// ---------------------------------------------------------------- settings
+
+const THEMES: [&str; 7] = ["dawn", "meadow", "ocean", "sunset", "night", "studio", "cozy"];
+const HZ_STEPS: [f32; 4] = [72.0, 80.0, 90.0, 120.0];
+
+/// The settings VRDoctor VR shares with the desktop app through
+/// ~/.config/vrdoctor/config.conf. Edited live from the in-headset
+/// Settings page; the desktop app's Settings tab writes the same keys.
+#[derive(Debug, Clone)]
+struct VrSettings {
+    accent_red: bool,
+    home_theme: String,
+    flip_panel: bool,
+    flip_env: bool,
+    render_scale: f32,
+    refresh_hz: f32,
+    panel_size: f32,
+}
+
+impl Default for VrSettings {
+    fn default() -> Self {
+        VrSettings { accent_red: false, home_theme: "dawn".into(), flip_panel: true, flip_env: false,
+                     render_scale: 1.0, refresh_hz: 90.0, panel_size: 1.0 }
+    }
+}
+
+fn load_settings() -> VrSettings {
+    let mut st = VrSettings::default();
+    let text = fs::read_to_string(config_file()).unwrap_or_default();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim();
+            match k.trim() {
+                "accent" => st.accent_red = v == "red",
+                "home_theme" => if THEMES.contains(&v) { st.home_theme = v.to_string() },
+                "flip_panel" => st.flip_panel = matches!(v, "1" | "true"),
+                "flip_env" => st.flip_env = matches!(v, "1" | "true"),
+                "render_scale" => st.render_scale = v.parse::<f32>().unwrap_or(1.0).clamp(0.5, 2.0),
+                "default_refresh" => st.refresh_hz = v.parse::<f32>().unwrap_or(90.0),
+                "panel_size" => st.panel_size = v.parse::<f32>().unwrap_or(1.0).clamp(0.7, 1.4),
+                _ => {}
+            }
+        }
+    }
+    st
+}
+
+/// Persist settings back into config.conf, preserving unrelated lines
+/// (backend, steam_root, ...) the desktop app owns.
+fn save_settings(st: &VrSettings) {
+    let path = config_file();
+    let mut lines: Vec<String> = fs::read_to_string(&path).unwrap_or_default().lines().map(|l| l.to_string()).collect();
+    let updates: [(&str, String); 7] = [
+        ("accent", if st.accent_red { "red".into() } else { "teal".into() }),
+        ("home_theme", st.home_theme.clone()),
+        ("flip_panel", (st.flip_panel as u8).to_string()),
+        ("flip_env", (st.flip_env as u8).to_string()),
+        ("render_scale", format!("{:.2}", st.render_scale)),
+        ("default_refresh", format!("{}", st.refresh_hz as u32)),
+        ("panel_size", format!("{:.2}", st.panel_size)),
+    ];
+    for (k, v) in updates {
+        let newline = format!("{k}={v}");
+        if let Some(l) = lines.iter_mut().find(|l| l.split('=').next().map(|lk| lk.trim() == k).unwrap_or(false)) { *l = newline; }
+        else { lines.push(newline); }
+    }
+    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    let _ = fs::write(&path, lines.join("\n") + "\n");
+}
+
+static SETTINGS: std::sync::OnceLock<std::sync::RwLock<VrSettings>> = std::sync::OnceLock::new();
+fn settings() -> VrSettings {
+    SETTINGS.get_or_init(|| std::sync::RwLock::new(load_settings()))
+        .read().map(|g| g.clone()).unwrap_or_else(|_| load_settings())
+}
+fn update_settings(f: impl FnOnce(&mut VrSettings)) -> VrSettings {
+    let cell = SETTINGS.get_or_init(|| std::sync::RwLock::new(load_settings()));
+    let mut g = cell.write().unwrap_or_else(|p| p.into_inner());
+    f(&mut g);
+    let snapshot = g.clone();
+    save_settings(&snapshot);
+    snapshot
+}
+
+/// The installed VR Home panorama (the configured theme preferred), if any.
 fn find_panorama() -> Option<PathBuf> {
     let dir = config_base().join("vrdoctor/home");
+    let themed = dir.join(format!("vrdoctor-home-{}.png", settings().home_theme));
+    if themed.is_file() { return Some(themed); }
     let dawn = dir.join("vrdoctor-home-dawn.png");
     if dawn.is_file() { return Some(dawn); }
     let mut found: Vec<PathBuf> = fs::read_dir(&dir).ok()?
@@ -180,15 +267,8 @@ type Rgba = [u8; 4];
 const TEAL: Rgba = [45, 212, 191, 255];
 const RED: Rgba = [239, 68, 68, 255];
 
-/// The user's accent colour (config `accent=teal|red`), read once.
-fn accent() -> Rgba {
-    use std::sync::OnceLock;
-    static A: OnceLock<Rgba> = OnceLock::new();
-    *A.get_or_init(|| {
-        let text = std::fs::read_to_string(config_base().join("vrdoctor/config.conf")).unwrap_or_default();
-        if text.lines().any(|l| l.trim() == "accent=red") { RED } else { TEAL }
-    })
-}
+/// The user's accent colour, from the live settings.
+fn accent() -> Rgba { if settings().accent_red { RED } else { TEAL } }
 const SLATE: Rgba = [13, 18, 32, 255];
 const WHITE: Rgba = [255, 255, 255, 255];
 
@@ -413,7 +493,23 @@ enum Region {
     PagePrev,
     PageNext,
     Quit,
+    Settings,
+    Back,
+    Recenter,
+    Theme(usize), // index into THEMES
+    ToggleFlipPanel,
+    ToggleFlipEnv,
+    ToggleAccent,
+    ScaleDown,
+    ScaleUp,
+    HzDown,
+    HzUp,
+    SizeDown,
+    SizeUp,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PanelTab { Library, Settings }
 
 /// Tile cell rect for slot i (0..PAGE_SIZE) — shared by render + hit test.
 fn cell_rect(slot: usize) -> Rect {
@@ -426,6 +522,8 @@ fn art_rect(slot: usize) -> Rect {
     Rect { x: c.x + (c.w - ART_W as f32) / 2.0, y: c.y + 4.0, w: ART_W as f32, h: ART_H as f32 }
 }
 fn quit_rect() -> Rect { Rect { x: PANEL_W as f32 - 56.0 - 190.0, y: 44.0, w: 190.0, h: 64.0 } }
+fn settings_btn_rect() -> Rect { Rect { x: quit_rect().x - 16.0 - 216.0, y: 44.0, w: 216.0, h: 64.0 } }
+fn recenter_rect() -> Rect { Rect { x: settings_btn_rect().x - 16.0 - 248.0, y: 44.0, w: 248.0, h: 64.0 } }
 fn prev_rect() -> Rect { Rect { x: 56.0, y: 1128.0, w: 120.0, h: 56.0 } }
 fn next_rect() -> Rect { Rect { x: PANEL_W as f32 - 56.0 - 120.0, y: 1128.0, w: 120.0, h: 56.0 } }
 
@@ -455,6 +553,10 @@ struct Panel {
     status_is_error: bool,
     art_cache: HashMap<usize, Option<image::RgbaImage>>, // by game index, pre-sized to ART_W×ART_H
     regions: Vec<(Rect, Region)>,
+    tab: PanelTab,
+    set_version: u64, // bumped on any settings change so the frame loop re-renders
+    recenter_requested: bool,
+    pano_watch: Option<(PathBuf, std::time::SystemTime)>, // environment being built
 }
 
 impl Panel {
@@ -467,10 +569,17 @@ impl Panel {
             status_is_error: false,
             art_cache: HashMap::new(),
             regions: vec![],
+            tab: PanelTab::Library,
+            set_version: 0,
+            recenter_requested: false,
+            pano_watch: None,
         })
     }
 
     fn pages(&self) -> usize { ((self.games.len() + PAGE_SIZE - 1) / PAGE_SIZE).max(1) }
+
+    fn world_w(&self) -> f32 { PANEL_WORLD_W * settings().panel_size }
+    fn world_h(&self) -> f32 { PANEL_WORLD_H * settings().panel_size }
 
     fn tile_art(&mut self, idx: usize) -> Option<image::RgbaImage> {
         if let Some(a) = self.art_cache.get(&idx) { return a.clone(); }
@@ -514,17 +623,44 @@ impl Panel {
         let title_base = 48.0 + self.fonts.ascent(56.0, true);
         self.fonts.draw(&mut r, "VRDoctor", 148.0, title_base, 56.0, true, WHITE);
         let sub_base = 112.0 + self.fonts.ascent(27.0, false);
-        self.fonts.draw(&mut r, "Your library in VR — point at a game and pull the trigger",
-                        148.0, sub_base, 27.0, false, [148, 163, 184, 255]);
+        let subtitle = if self.tab == PanelTab::Settings {
+            "Settings — changes save automatically; most apply instantly"
+        } else {
+            "Your library in VR — point at a game and pull the trigger"
+        };
+        self.fonts.draw(&mut r, subtitle, 148.0, sub_base, 27.0, false, [148, 163, 184, 255]);
 
-        // Quit button.
+        // Header buttons: Quit, Settings/Library, Recenter.
+        let qb = 44.0 + 20.0 + self.fonts.ascent(30.0, true);
         let q = quit_rect();
-        let q_hover = hover.contains(&Some(Region::Quit));
-        r.fill_rounded_rect(q.x, q.y, q.w, q.h, 14.0, if q_hover { [51, 65, 85, 255] } else { [30, 41, 59, 255] });
-        let qb = q.y + 20.0 + self.fonts.ascent(30.0, true);
+        r.fill_rounded_rect(q.x, q.y, q.w, q.h, 14.0, if hover.contains(&Some(Region::Quit)) { [51, 65, 85, 255] } else { [30, 41, 59, 255] });
         self.fonts.draw_centered(&mut r, "× Quit", q.x + q.w / 2.0, qb, 30.0, true, WHITE);
         self.regions.push((q, Region::Quit));
+        let sb = settings_btn_rect();
+        let (sb_label, sb_region) = if self.tab == PanelTab::Settings { ("‹ Library", Region::Back) } else { ("⚙ Settings", Region::Settings) };
+        r.fill_rounded_rect(sb.x, sb.y, sb.w, sb.h, 14.0, if hover.contains(&Some(sb_region)) { [51, 65, 85, 255] } else { [30, 41, 59, 255] });
+        self.fonts.draw_centered(&mut r, sb_label, sb.x + sb.w / 2.0, qb, 30.0, true, WHITE);
+        self.regions.push((sb, sb_region));
+        let rc = recenter_rect();
+        r.fill_rounded_rect(rc.x, rc.y, rc.w, rc.h, 14.0, if hover.contains(&Some(Region::Recenter)) { [51, 65, 85, 255] } else { [30, 41, 59, 255] });
+        self.fonts.draw_centered(&mut r, "◎ Recenter", rc.x + rc.w / 2.0, qb, 30.0, true, WHITE);
+        self.regions.push((rc, Region::Recenter));
 
+        match self.tab {
+            PanelTab::Library => self.draw_library(&mut r, hover),
+            PanelTab::Settings => self.draw_settings(&mut r, hover),
+        }
+
+        // Laser dots last, on top of everything.
+        for dot in dots.iter().flatten() {
+            r.fill_circle(dot.0, dot.1, 10.0, accent());
+            r.fill_circle(dot.0, dot.1, 4.5, WHITE);
+        }
+        r
+    }
+
+    /// The games grid + footer (the Library tab body).
+    fn draw_library(&mut self, mut r: &mut Raster, hover: [Option<Region>; 2]) {
         // Games grid (or the empty message).
         if self.games.is_empty() {
             let base = 640.0 + self.fonts.ascent(34.0, false);
@@ -605,12 +741,85 @@ impl Panel {
         let sb = 1140.0 + self.fonts.ascent(27.0, false);
         self.fonts.draw_centered(&mut r, &status, PANEL_W as f32 / 2.0, sb, 27.0, false, scol);
 
-        // Laser dots last, on top of everything.
-        for dot in dots.iter().flatten() {
-            r.fill_circle(dot.0, dot.1, 10.0, accent());
-            r.fill_circle(dot.0, dot.1, 4.5, WHITE);
+    }
+
+    fn toggle_row(&mut self, r: &mut Raster, hover: [Option<Region>; 2], y: f32, label: &str, on: bool, region: Region) {
+        let lb = y + 20.0 + self.fonts.ascent(29.0, false);
+        self.fonts.draw(r, label, 56.0, lb, 29.0, false, WHITE);
+        let rect = Rect { x: PANEL_W as f32 - 56.0 - 240.0, y, w: 240.0, h: 64.0 };
+        let fill = if on { accent() } else if hover.contains(&Some(region)) { [51, 65, 85, 255] } else { [30, 41, 59, 255] };
+        r.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 14.0, fill);
+        let tb = rect.y + 20.0 + self.fonts.ascent(29.0, true);
+        self.fonts.draw_centered(r, if on { "ON" } else { "OFF" }, rect.x + rect.w / 2.0, tb, 29.0, true,
+                                if on { [6, 24, 22, 255] } else { WHITE });
+        self.regions.push((rect, region));
+    }
+
+    fn stepper_row(&mut self, r: &mut Raster, hover: [Option<Region>; 2], y: f32, label: &str, value: &str, note: &str, down: Region, up: Region) {
+        let lb = y + 20.0 + self.fonts.ascent(29.0, false);
+        self.fonts.draw(r, label, 56.0, lb, 29.0, false, WHITE);
+        let minus = Rect { x: 1560.0, y, w: 96.0, h: 64.0 };
+        let plus = Rect { x: 1896.0, y, w: 96.0, h: 64.0 };
+        for (rect, region, glyph) in [(minus, down, "−"), (plus, up, "+")] {
+            let fill = if hover.contains(&Some(region)) { [51, 65, 85, 255] } else { [30, 41, 59, 255] };
+            r.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 14.0, fill);
+            let tb = rect.y + 20.0 + self.fonts.ascent(30.0, true);
+            self.fonts.draw_centered(r, glyph, rect.x + rect.w / 2.0, tb, 30.0, true, WHITE);
+            self.regions.push((rect, region));
         }
-        r
+        let vb = y + 20.0 + self.fonts.ascent(30.0, true);
+        self.fonts.draw_centered(r, value, 1776.0, vb, 30.0, true, WHITE);
+        let nb = y + 64.0 + 8.0 + self.fonts.ascent(22.0, false);
+        self.fonts.draw(r, note, 56.0, nb, 22.0, false, [148, 163, 184, 255]);
+    }
+
+    /// The Settings tab body: environment picker, display flips, accent,
+    /// resolution / refresh / panel-size steppers.
+    fn draw_settings(&mut self, r: &mut Raster, hover: [Option<Region>; 2]) {
+        let st = settings();
+        let sec_base = 176.0 + self.fonts.ascent(30.0, true);
+        self.fonts.draw(r, "Environment", 56.0, sec_base, 30.0, true, accent());
+        for (i, t) in THEMES.iter().enumerate() {
+            let rect = Rect { x: 56.0 + (i % 4) as f32 * 490.0, y: 236.0 + (i / 4) as f32 * 88.0, w: 466.0, h: 72.0 };
+            let selected = st.home_theme == *t;
+            let fill = if selected { accent() } else if hover.contains(&Some(Region::Theme(i))) { [51, 65, 85, 255] } else { [30, 41, 59, 255] };
+            r.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 14.0, fill);
+            let name = t[..1].to_uppercase() + &t[1..];
+            let tb = rect.y + 20.0 + self.fonts.ascent(29.0, true);
+            self.fonts.draw_centered(r, &name, rect.x + rect.w / 2.0, tb, 29.0, true,
+                                     if selected { [6, 24, 22, 255] } else { WHITE });
+            self.regions.push((rect, Region::Theme(i)));
+        }
+
+        self.toggle_row(r, hover, 424.0, "Flip panel — if the panel looks upside down", st.flip_panel, Region::ToggleFlipPanel);
+        self.toggle_row(r, hover, 512.0, "Flip environment — if the world looks upside down", st.flip_env, Region::ToggleFlipEnv);
+
+        // Accent row: the button wears the accent colour itself.
+        let lb = 600.0 + 20.0 + self.fonts.ascent(29.0, false);
+        self.fonts.draw(r, "Accent colour", 56.0, lb, 29.0, false, WHITE);
+        let arect = Rect { x: PANEL_W as f32 - 56.0 - 240.0, y: 600.0, w: 240.0, h: 64.0 };
+        r.fill_rounded_rect(arect.x, arect.y, arect.w, arect.h, 14.0, accent());
+        let atb = arect.y + 20.0 + self.fonts.ascent(29.0, true);
+        self.fonts.draw_centered(r, if st.accent_red { "Red" } else { "Teal" }, arect.x + arect.w / 2.0, atb, 29.0, true, [6, 24, 22, 255]);
+        self.regions.push((arect, Region::ToggleAccent));
+
+        self.stepper_row(r, hover, 712.0, "Resolution scale",
+                         &format!("{}%", (st.render_scale * 100.0).round() as i32),
+                         "How sharp this app renders — applies next time VRDoctor VR starts",
+                         Region::ScaleDown, Region::ScaleUp);
+        self.stepper_row(r, hover, 836.0, "Refresh rate",
+                         &format!("{} Hz", st.refresh_hz as u32),
+                         "Requested from the runtime when VRDoctor VR starts, when supported",
+                         Region::HzDown, Region::HzUp);
+        self.stepper_row(r, hover, 960.0, "Panel size",
+                         &format!("{}%", (st.panel_size * 100.0).round() as i32),
+                         "Applies instantly",
+                         Region::SizeDown, Region::SizeUp);
+
+        let status = if self.status.is_empty() { "Settings save automatically".to_string() } else { self.status.clone() };
+        let scol: Rgba = if self.status_is_error { [248, 113, 113, 255] } else { [203, 213, 225, 255] };
+        let sb = 1140.0 + self.fonts.ascent(27.0, false);
+        self.fonts.draw_centered(r, &status, PANEL_W as f32 / 2.0, sb, 27.0, false, scol);
     }
 
     fn region_at(&self, x: f32, y: f32) -> Option<Region> {
@@ -818,12 +1027,14 @@ const SPHERE_FRAG: &str = r#"#version 330 core
 in vec3 v_dir;
 uniform sampler2D u_tex;
 uniform int u_has_tex;
+uniform int u_flip_env;
 out vec4 o_color;
 void main() {
     vec3 d = normalize(v_dir);
     if (u_has_tex == 1) {
         float u = atan(d.x, -d.z) / 6.28318530718 + 0.5;
         float v = acos(clamp(d.y, -1.0, 1.0)) / 3.14159265359;
+        if (u_flip_env == 1) { v = 1.0 - v; }
         o_color = texture(u_tex, vec2(u, v));
     } else {
         vec3 horizon = vec3(0.115, 0.145, 0.215);
@@ -878,6 +1089,32 @@ fn compile_program(gl: &glow::Context, vs_src: &str, fs_src: &str) -> VResult<gl
     }
 }
 
+
+/// Load the installed VR Home panorama as a GL texture (max 4096 wide).
+fn load_pano_texture(gl: &glow::Context) -> Option<glow::Texture> {
+    use glow::HasContext;
+    let path = find_panorama()?;
+    let img = image::open(&path).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let (img, w, h) = if w > 4096 {
+        let nh = (h as f32 * 4096.0 / w as f32) as u32;
+        (image::imageops::resize(&img, 4096, nh, image::imageops::FilterType::Triangle), 4096, nh)
+    } else { (img, w, h) };
+    unsafe {
+        let tex = gl.create_texture().ok()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::SRGB8_ALPHA8 as i32, w as i32, h as i32, 0,
+                        glow::RGBA, glow::UNSIGNED_BYTE, Some(img.as_raw().as_slice()));
+        gl.generate_mipmap(glow::TEXTURE_2D);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        Some(tex)
+    }
+}
+
 struct GlScene {
     gl: glow::Context,
     sphere_program: glow::Program,
@@ -887,6 +1124,7 @@ struct GlScene {
     line_vao: glow::VertexArray,
     line_vbo: glow::Buffer,
     pano_texture: Option<glow::Texture>,
+    flip_env: bool,
     fbos: HashMap<u32, glow::Framebuffer>, // per swapchain texture
 }
 
@@ -934,27 +1172,7 @@ impl GlScene {
             gl.bind_vertex_array(None);
         }
         // Panorama texture (optional — gradient fallback in the shader).
-        let pano_texture = find_panorama().and_then(|path| {
-            let img = image::open(&path).ok()?.to_rgba8();
-            let (w, h) = img.dimensions();
-            let (img, w, h) = if w > 4096 {
-                let nh = (h as f32 * 4096.0 / w as f32) as u32;
-                (image::imageops::resize(&img, 4096, nh, image::imageops::FilterType::Triangle), 4096, nh)
-            } else { (img, w, h) };
-            unsafe {
-                let tex = gl.create_texture().ok()?;
-                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::SRGB8_ALPHA8 as i32, w as i32, h as i32, 0,
-                                glow::RGBA, glow::UNSIGNED_BYTE, Some(img.as_raw().as_slice()));
-                gl.generate_mipmap(glow::TEXTURE_2D);
-                gl.bind_texture(glow::TEXTURE_2D, None);
-                Some(tex)
-            }
-        });
+        let pano_texture = load_pano_texture(&gl);
 
         Ok(GlScene {
             gl,
@@ -965,8 +1183,17 @@ impl GlScene {
             line_vao,
             line_vbo,
             pano_texture,
+            flip_env: settings().flip_env,
             fbos: HashMap::new(),
         })
+    }
+
+    /// Re-read the panorama from disk (after an environment switch).
+    fn reload_panorama(&mut self) {
+        use glow::HasContext;
+        let new = load_pano_texture(&self.gl);
+        unsafe { if let Some(old) = self.pano_texture { self.gl.delete_texture(old); } }
+        self.pano_texture = new;
     }
 
     fn framebuffer_for(&mut self, tex: u32) -> VResult<glow::Framebuffer> {
@@ -1013,6 +1240,9 @@ impl GlScene {
             }
             if let Some(loc) = self.gl.get_uniform_location(self.sphere_program, "u_has_tex") {
                 self.gl.uniform_1_i32(Some(&loc), if self.pano_texture.is_some() { 1 } else { 0 });
+            }
+            if let Some(loc) = self.gl.get_uniform_location(self.sphere_program, "u_flip_env") {
+                self.gl.uniform_1_i32(Some(&loc), if self.flip_env { 1 } else { 0 });
             }
             self.gl.active_texture(glow::TEXTURE0);
             self.gl.bind_texture(glow::TEXTURE_2D, self.pano_texture);
@@ -1107,13 +1337,27 @@ impl GlScene {
     }
 
     /// Upload the CPU panel raster into a quad-layer swapchain texture.
-    fn upload_panel(&self, tex: u32, raster: &Raster) {
+    /// With `flip`, rows are uploaded bottom-up: GL texture memory starts
+    /// at the image's bottom as far as the compositor's UVs are
+    /// concerned, and an unflipped upload shows the panel upside down
+    /// in the headset (confirmed on a real Quest 3 + WiVRn).
+    fn upload_panel(&self, tex: u32, raster: &Raster, flip: bool) {
         use glow::HasContext;
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(native_texture(tex)));
-            self.gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, raster.w as i32, raster.h as i32,
-                                     glow::RGBA, glow::UNSIGNED_BYTE,
-                                     glow::PixelUnpackData::Slice(&raster.px));
+            if flip {
+                let row = raster.w * 4;
+                for y in 0..raster.h {
+                    let src = (raster.h - 1 - y) * row;
+                    self.gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, y as i32, raster.w as i32, 1,
+                                             glow::RGBA, glow::UNSIGNED_BYTE,
+                                             glow::PixelUnpackData::Slice(&raster.px[src..src + row]));
+                }
+            } else {
+                self.gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, raster.w as i32, raster.h as i32,
+                                         glow::RGBA, glow::UNSIGNED_BYTE,
+                                         glow::PixelUnpackData::Slice(&raster.px));
+            }
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
     }
@@ -1145,7 +1389,7 @@ fn compute_panel_pose(view: openxr::Posef) -> openxr::Posef {
 
 /// Intersect a controller ray with the panel quad.
 /// Returns (raster_x, raster_y, distance) on a hit.
-fn intersect_panel(origin: [f32; 3], dir: [f32; 3], pose: openxr::Posef) -> Option<(f32, f32, f32)> {
+fn intersect_panel(origin: [f32; 3], dir: [f32; 3], pose: openxr::Posef, world_w: f32, world_h: f32) -> Option<(f32, f32, f32)> {
     let q = pose.orientation;
     let normal = quat_rotate(q, [0.0, 0.0, 1.0]);
     let right = quat_rotate(q, [1.0, 0.0, 0.0]);
@@ -1159,15 +1403,67 @@ fn intersect_panel(origin: [f32; 3], dir: [f32; 3], pose: openxr::Posef) -> Opti
     let rel = v3_sub(p, center);
     let dx = v3_dot(rel, right);
     let dy = v3_dot(rel, up);
-    if dx.abs() > PANEL_WORLD_W / 2.0 || dy.abs() > PANEL_WORLD_H / 2.0 { return None; }
-    let rx = (dx / PANEL_WORLD_W + 0.5) * PANEL_W as f32;
-    let ry = (0.5 - dy / PANEL_WORLD_H) * PANEL_H as f32;
+    if dx.abs() > world_w / 2.0 || dy.abs() > world_h / 2.0 { return None; }
+    let rx = (dx / world_w + 0.5) * PANEL_W as f32;
+    let ry = (0.5 - dy / world_h) * PANEL_H as f32;
     Some((rx, ry, t))
+}
+
+fn hz_step(cur: f32, dir: i32) -> f32 {
+    let idx = HZ_STEPS.iter().position(|h| (*h - cur).abs() < 0.5).unwrap_or(2) as i32;
+    HZ_STEPS[(idx + dir).clamp(0, HZ_STEPS.len() as i32 - 1) as usize]
 }
 
 fn activate(region: Region, panel: &mut Panel, exit_at: &mut Option<Instant>) {
     match region {
         Region::Quit => *exit_at = Some(Instant::now()),
+        Region::Settings => panel.tab = PanelTab::Settings,
+        Region::Back => panel.tab = PanelTab::Library,
+        Region::Recenter => panel.recenter_requested = true,
+        Region::Theme(i) => {
+            let name = THEMES[i];
+            update_settings(|st| st.home_theme = name.to_string());
+            let spawned = Command::new("setsid")
+                .arg(sibling("vrdoctor"))
+                .args(["home", "--theme", name])
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                .spawn();
+            match spawned {
+                Ok(_) => {
+                    panel.status = format!("Building the {name} environment…");
+                    panel.status_is_error = false;
+                    let path = config_base().join("vrdoctor/home").join(format!("vrdoctor-home-{name}.png"));
+                    panel.pano_watch = Some((path, std::time::SystemTime::now()));
+                }
+                Err(e) => {
+                    panel.status = format!("Could not start the environment builder: {e}");
+                    panel.status_is_error = true;
+                }
+            }
+            panel.set_version += 1;
+        }
+        Region::ToggleFlipPanel => {
+            let st = update_settings(|st| st.flip_panel = !st.flip_panel);
+            panel.status = format!("Panel flip {}", if st.flip_panel { "on" } else { "off" });
+            panel.status_is_error = false;
+            panel.set_version += 1;
+        }
+        Region::ToggleFlipEnv => {
+            let st = update_settings(|st| st.flip_env = !st.flip_env);
+            panel.status = format!("Environment flip {}", if st.flip_env { "on" } else { "off" });
+            panel.status_is_error = false;
+            panel.set_version += 1;
+        }
+        Region::ToggleAccent => {
+            update_settings(|st| st.accent_red = !st.accent_red);
+            panel.set_version += 1;
+        }
+        Region::ScaleDown => { update_settings(|st| st.render_scale = (st.render_scale - 0.25).clamp(0.5, 2.0)); panel.set_version += 1; }
+        Region::ScaleUp => { update_settings(|st| st.render_scale = (st.render_scale + 0.25).clamp(0.5, 2.0)); panel.set_version += 1; }
+        Region::HzDown => { update_settings(|st| st.refresh_hz = hz_step(st.refresh_hz, -1)); panel.set_version += 1; }
+        Region::HzUp => { update_settings(|st| st.refresh_hz = hz_step(st.refresh_hz, 1)); panel.set_version += 1; }
+        Region::SizeDown => { update_settings(|st| st.panel_size = (st.panel_size - 0.1).clamp(0.7, 1.4)); panel.set_version += 1; }
+        Region::SizeUp => { update_settings(|st| st.panel_size = (st.panel_size + 0.1).clamp(0.7, 1.4)); panel.set_version += 1; }
         Region::PagePrev => panel.page = panel.page.saturating_sub(1),
         Region::PageNext => panel.page = (panel.page + 1).min(panel.pages() - 1),
         Region::Launch(idx) => {
@@ -1265,9 +1561,11 @@ fn run(opts: &Opts) -> VResult<()> {
         return Err("the active OpenXR runtime does not offer XR_KHR_opengl_enable + \
                     XR_MNDX_egl_enable, which vrdoctor-vr needs for its EGL/OpenGL path".into());
     }
+    let have_refresh = available.fb_display_refresh_rate;
     let mut exts = openxr::ExtensionSet::default();
     exts.khr_opengl_enable = true;
     exts.mndx_egl_enable = true;
+    exts.fb_display_refresh_rate = have_refresh;
     let instance = entry.create_instance(
         &openxr::ApplicationInfo {
             application_name: "VRDoctor VR",
@@ -1312,8 +1610,10 @@ fn run(opts: &Opts) -> VResult<()> {
 
     // Eye swapchains.
     let mut eyes: Vec<EyeSwap> = vec![];
+    let render_scale = settings().render_scale;
     for vc in &view_configs {
-        let (w, h) = (vc.recommended_image_rect_width.max(16), vc.recommended_image_rect_height.max(16));
+        let (w, h) = (((vc.recommended_image_rect_width as f32 * render_scale) as u32).clamp(16, 8192),
+                      ((vc.recommended_image_rect_height as f32 * render_scale) as u32).clamp(16, 8192));
         let sc = session.create_swapchain(&openxr::SwapchainCreateInfo {
             create_flags: openxr::SwapchainCreateFlags::EMPTY,
             usage_flags: openxr::SwapchainUsageFlags::COLOR_ATTACHMENT | openxr::SwapchainUsageFlags::SAMPLED,
@@ -1384,12 +1684,32 @@ fn run(opts: &Opts) -> VResult<()> {
     let mut panel = Panel::new(load_games())?;
     let mut raster = panel.render([None, None], [None, None]);
     let mut upload_needed = true;
-    type Sig = (i64, i64, [Option<(i32, i32)>; 2], usize, String, bool);
+    type Sig = (i64, i64, [Option<(i32, i32)>; 2], usize, String, bool, u8, u64);
     let region_key = |r: Option<Region>| -> i64 {
-        match r { None => -1, Some(Region::Quit) => -2, Some(Region::PagePrev) => -3,
-                  Some(Region::PageNext) => -4, Some(Region::Launch(i)) => i as i64 }
+        match r {
+            None => -1,
+            Some(Region::Quit) => -2,
+            Some(Region::PagePrev) => -3,
+            Some(Region::PageNext) => -4,
+            Some(Region::Settings) => -5,
+            Some(Region::Back) => -6,
+            Some(Region::Recenter) => -7,
+            Some(Region::Theme(i)) => -10 - i as i64,
+            Some(Region::ToggleFlipPanel) => -20,
+            Some(Region::ToggleFlipEnv) => -21,
+            Some(Region::ToggleAccent) => -22,
+            Some(Region::ScaleDown) => -23,
+            Some(Region::ScaleUp) => -24,
+            Some(Region::HzDown) => -25,
+            Some(Region::HzUp) => -26,
+            Some(Region::SizeDown) => -27,
+            Some(Region::SizeUp) => -28,
+            Some(Region::Launch(i)) => i as i64,
+        }
     };
     let mut last_sig: Option<Sig> = None;
+    let mut last_flip = settings().flip_panel;
+    let mut refresh_done = false;
 
     let mut event_buffer = openxr::EventDataBuffer::new();
     let mut running = false;
@@ -1411,6 +1731,23 @@ fn run(opts: &Opts) -> VResult<()> {
                         session.begin(ViewConfigurationType::PRIMARY_STEREO)
                             .map_err(|err| format!("xrBeginSession: {err:?}"))?;
                         running = true;
+                        if have_refresh && !refresh_done {
+                            refresh_done = true;
+                            let want = settings().refresh_hz;
+                            if want > 0.0 {
+                                if let Ok(rates) = session.enumerate_display_refresh_rates() {
+                                    let pick = rates.iter().copied().min_by(|a, b| {
+                                        (a - want).abs().partial_cmp(&(b - want).abs()).unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+                                    if let Some(r) = pick {
+                                        match session.request_display_refresh_rate(r) {
+                                            Ok(()) => eprintln!("vrdoctor-vr: display refresh set to {r} Hz (wanted {want})"),
+                                            Err(e) => eprintln!("vrdoctor-vr: refresh request failed: {e:?}"),
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     } else if state == openxr::SessionState::STOPPING {
                         let _ = session.end();
                         running = false;
@@ -1462,6 +1799,29 @@ fn run(opts: &Opts) -> VResult<()> {
             && !views.is_empty() {
             panel_pose = Some(compute_panel_pose(views[0].pose));
         }
+        if panel.recenter_requested {
+            panel.recenter_requested = false;
+            if view_flags.contains(openxr::ViewStateFlags::ORIENTATION_VALID) && !views.is_empty() {
+                panel_pose = Some(compute_panel_pose(views[0].pose));
+            }
+        }
+        if let Some((path, since)) = &panel.pano_watch {
+            let done = path.is_file()
+                && fs::metadata(path).and_then(|m| m.modified()).map(|t| t > *since).unwrap_or(false);
+            let stale = since.elapsed().map(|d| d > Duration::from_secs(30)).unwrap_or(false);
+            if done {
+                scene.reload_panorama();
+                panel.status = format!("Environment: {}", settings().home_theme);
+                panel.status_is_error = false;
+                panel.set_version += 1;
+                panel.pano_watch = None;
+            } else if stale {
+                panel.status = "Environment switch timed out — try again".into();
+                panel.status_is_error = true;
+                panel.set_version += 1;
+                panel.pano_watch = None;
+            }
+        }
         // ---- input
         let mut hovers: [Option<Region>; 2] = [None, None];
         let mut dots: [Option<(f32, f32)>; 2] = [None, None];
@@ -1476,7 +1836,7 @@ fn run(opts: &Opts) -> VResult<()> {
                 let dir = v3_norm(quat_rotate(loc.pose.orientation, [0.0, 0.0, -1.0]));
                 let mut end = v3_add(origin, v3_scale(dir, 3.5));
                 if let Some(pp) = panel_pose {
-                    if let Some((rx, ry, t)) = intersect_panel(origin, dir, pp) {
+                    if let Some((rx, ry, t)) = intersect_panel(origin, dir, pp, panel.world_w(), panel.world_h()) {
                         dots[hand] = Some((rx, ry));
                         hovers[hand] = panel.region_at(rx, ry);
                         end = v3_add(origin, v3_scale(dir, t));
@@ -1493,6 +1853,9 @@ fn run(opts: &Opts) -> VResult<()> {
             }
         }
         // ---- panel re-render if anything visible changed
+        scene.flip_env = settings().flip_env;
+        let flip_now = settings().flip_panel;
+        if flip_now != last_flip { upload_needed = true; last_flip = flip_now; }
         let sig: Sig = (
             region_key(hovers[0]),
             region_key(hovers[1]),
@@ -1500,6 +1863,8 @@ fn run(opts: &Opts) -> VResult<()> {
             panel.page,
             panel.status.clone(),
             panel.status_is_error,
+            if panel.tab == PanelTab::Settings { 1 } else { 0 },
+            panel.set_version,
         );
         if last_sig.as_ref() != Some(&sig) {
             raster = panel.render(hovers, dots);
@@ -1532,7 +1897,7 @@ fn run(opts: &Opts) -> VResult<()> {
             let idx = quad_swapchain.acquire_image().map_err(|e| format!("acquire panel image: {e:?}"))?;
             quad_swapchain.wait_image(openxr::Duration::INFINITE).map_err(|e| format!("wait panel image: {e:?}"))?;
             let tex = quad_images[idx as usize];
-            scene.upload_panel(tex, &raster);
+            scene.upload_panel(tex, &raster, last_flip);
             quad_swapchain.release_image().map_err(|e| format!("release panel image: {e:?}"))?;
             upload_needed = false;
         }
@@ -1552,7 +1917,7 @@ fn run(opts: &Opts) -> VResult<()> {
                     })
                     .image_array_index(0))
                 .pose(pp)
-                .size(openxr::Extent2Df { width: PANEL_WORLD_W, height: PANEL_WORLD_H });
+                .size(openxr::Extent2Df { width: panel.world_w(), height: panel.world_h() });
             layers.push(&*quad);
         }
         stream.end(time, blend, &layers).map_err(|e| format!("xrEndFrame: {e:?}"))?;
@@ -1570,7 +1935,9 @@ fn run(opts: &Opts) -> VResult<()> {
 
 // ---------------------------------------------------------------- test hooks
 
-fn dump_panel(path: &str) -> VResult<()> {
+fn dump_panel(path: &str) -> VResult<()> { dump_panel_tab(path, false) }
+fn dump_settings(path: &str) -> VResult<()> { dump_panel_tab(path, true) }
+fn dump_panel_tab(path: &str, settings_tab: bool) -> VResult<()> {
     let mut games = load_games();
     if games.is_empty() {
         games = vec![
@@ -1581,10 +1948,15 @@ fn dump_panel(path: &str) -> VResult<()> {
         ];
     }
     let mut panel = Panel::new(games)?;
+    if settings_tab { panel.tab = PanelTab::Settings; }
     let slot = if panel.games.len() > 1 { 1 } else { 0 };
     let art = art_rect(slot);
     let dot = (art.x + art.w / 2.0, art.y + art.h / 2.0);
-    let raster = panel.render([Some(Region::Launch(slot)), None], [Some(dot), None]);
+    let raster = if settings_tab {
+        panel.render([Some(Region::Theme(2)), None], [None, None])
+    } else {
+        panel.render([Some(Region::Launch(slot)), None], [Some(dot), None])
+    };
     let img = image::RgbaImage::from_raw(PANEL_W as u32, PANEL_H as u32, raster.px)
         .ok_or("raster size mismatch")?;
     img.save(path).map_err(|e| format!("save panel PNG: {e}"))?;
@@ -1597,6 +1969,14 @@ fn main() {
         let path = args.get(i + 1).map(|s| s.as_str()).unwrap_or("/tmp/vrdoctor-panel.png");
         match dump_panel(path) {
             Ok(()) => println!("panel written to {path}"),
+            Err(e) => { eprintln!("vrdoctor-vr: {e}"); std::process::exit(1); }
+        }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--dump-settings") {
+        let path = args.get(i + 1).map(|s| s.as_str()).unwrap_or("/tmp/vrdoctor-settings.png");
+        match dump_settings(path) {
+            Ok(()) => println!("settings panel written to {path}"),
             Err(e) => { eprintln!("vrdoctor-vr: {e}"); std::process::exit(1); }
         }
         return;

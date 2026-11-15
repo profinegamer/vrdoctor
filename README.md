@@ -114,7 +114,34 @@ vrdoctor vr                  # register with WiVRn and open the VR UI now
 vrdoctor vr --register-only  # just (re)write the WiVRn launcher entry
 ```
 
-Under the hood it's a native OpenXR app (`vrdoctor-vr`, OpenGL via EGL) that reads the same library as the desktop app — Steam games are sorted VR-first, custom games included. WiVRn finds it through a desktop entry with the `X-WiVRn-VR` category in `~/.local/share/applications` (written by the installer, by `vrdoctor vr`, or shipped by the packages). Honest status: verified end-to-end against Monado's simulated headset (real session, frames rendered); the first run on a real Quest may still surface quirks — reports welcome.
+Under the hood it's a native OpenXR app (`vrdoctor-vr`, OpenGL via EGL) that reads the same library as the desktop app — Steam games are sorted VR-first, custom games included. WiVRn finds it through a desktop entry with the `X-WiVRn-VR` category in `~/.local/share/applications` (written by the installer, by `vrdoctor vr`, or shipped by the packages). Honest status: confirmed working on a real Quest 3 over WiVRn (first real-hardware run found the panel rendering upside down — fixed in v0.9.0 with a default-on texture flip, toggleable in Settings).
+
+## Settings (PC tab + in-headset page)
+
+Both apps share one settings file (`~/.config/vrdoctor/config.conf`) and
+one Settings UI — the desktop app's **🎛 Settings** tab and, inside the
+headset, **VRDoctor VR → ⚙ Settings**:
+
+- **Environment picker** — switch the VR Home world (dawn, meadow,
+  ocean, sunset, night, studio, cozy) + brightness. On the PC it applies
+  when you click *Apply environment*; in the headset the new world is
+  built and swapped in live.
+- **Refresh rate (Hz)** — 72 / 80 / 90 / 120. VRDoctor VR requests the
+  rate from the runtime at startup (XR_FB_display_refresh_rate) when
+  the runtime supports it. For games, the streaming rate is picked in
+  the WiVRn app on the Quest itself — no PC app can set that for them.
+- **Resolution scale** — 50–200%, how sharp VRDoctor VR itself renders.
+  (Game streaming resolution likewise lives in the WiVRn app on the
+  Quest.)
+- **Display flips** — if the panel or the environment ever looks upside
+  down in the headset, flip either one, live, from either app. The
+  panel flip is on by default: the compositor samples the panel texture
+  upside down otherwise (confirmed on a real Quest 3).
+- **Panel size + Recenter** (in-headset) — make the floating panel
+  bigger or smaller, and re-place it in front of you, from the header's
+  **◎ Recenter** button.
+- Plus the basics: dark mode, accent colour (teal/red), default
+  backend.
 
 ## Flatpak Steam
 

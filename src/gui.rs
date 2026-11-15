@@ -102,7 +102,7 @@ fn card<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { Games, Doctor, AddGame, Shell, Setup }
+enum Tab { Games, Doctor, AddGame, Shell, Setup, Settings }
 
 /// A launch requested by a tile, card or the detail bar — acted on after
 /// the UI pass so borrows stay simple.
@@ -169,6 +169,8 @@ pub struct VrDoctorApp {
     /// lag badly on real libraries.
     vr_info: std::collections::HashMap<u64, (VrSupport, String)>,
     confirm_uninstall: bool,
+    set_theme: String,
+    set_brightness: f32,
 }
 
 impl VrDoctorApp {
@@ -186,6 +188,8 @@ impl VrDoctorApp {
         spawn_art_download(&cc.egui_ctx, games.iter().map(|g| g.appid).collect());
         let vr_info = games.iter().map(|g| (g.appid, classify_game(g, false))).collect();
         let accent_red = cfg.accent == "red";
+        let set_theme = cfg.home_theme.clone();
+        let set_brightness = cfg.home_brightness;
         Self {
             steam_games: games,
             custom_games: load_custom_games(),
@@ -214,6 +218,8 @@ impl VrDoctorApp {
             art_bad: std::collections::HashSet::new(),
             vr_info,
             confirm_uninstall: false,
+            set_theme,
+            set_brightness,
         }
     }
 
@@ -299,6 +305,7 @@ impl eframe::App for VrDoctorApp {
                 ui.selectable_value(&mut self.tab, Tab::AddGame, "➕ Add custom game");
                 ui.selectable_value(&mut self.tab, Tab::Shell, "🌐 VR Shell");
                 ui.selectable_value(&mut self.tab, Tab::Setup, "⚙ Setup");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "🎛 Settings");
             });
         });
 
@@ -311,6 +318,7 @@ impl eframe::App for VrDoctorApp {
                 Tab::AddGame => self.add_game_tab(ui),
                 Tab::Shell => self.shell_tab(ui),
                 Tab::Setup => self.setup_tab(ui),
+                Tab::Settings => self.settings_tab(ui),
             }
         });
     }
@@ -632,6 +640,80 @@ impl VrDoctorApp {
             if ui.button("▬ Start the bar only").clicked() { self.status = start_bar(); }
         });
         ui.small("Mark any game as 2D in the Add custom game tab (Mode: 2D), or launch a Steam game with the ▶ 2D button in the Games tab.");
+    }
+
+
+    fn save_cfg(&mut self) { let _ = save_config(&self.cfg); }
+
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        ui.small("Changes save automatically and are shared with VRDoctor VR in the headset.");
+        ui.separator();
+
+        ui.label(egui::RichText::new("Appearance").size(17.0).strong().color(accent()));
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut self.dark_mode, "🌙 Dark mode").changed() { self.apply_theme(ui.ctx()); }
+            ui.label("Accent:");
+            if ui.selectable_value(&mut self.accent_red, true, "Red").changed() { self.apply_accent(ui.ctx()); }
+            if ui.selectable_value(&mut self.accent_red, false, "Teal").changed() { self.apply_accent(ui.ctx()); }
+        });
+        ui.separator();
+
+        ui.label(egui::RichText::new("Streaming & VR").size(17.0).strong().color(accent()));
+        ui.horizontal(|ui| {
+            ui.label("Backend:");
+            let mut backend = self.cfg.backend.clone();
+            for (b, label) in [("wivrn", "WiVRn"), ("alvr", "ALVR"), ("steamlink", "Steam Link")] {
+                if ui.selectable_value(&mut backend, b.to_string(), label).changed() {
+                    self.cfg.backend = backend.clone();
+                    self.backend = backend.clone();
+                    self.save_cfg();
+                }
+            }
+        });
+        let mut hz = self.cfg.default_refresh as i32;
+        if ui.add(egui::Slider::new(&mut hz, 72..=120).text("Refresh rate (Hz)")).changed() {
+            self.cfg.default_refresh = hz as u32;
+            self.save_cfg();
+        }
+        ui.small("VRDoctor VR asks the runtime for this rate. For games, the rate is picked in the WiVRn app on the Quest.");
+        let mut pct = (self.cfg.render_scale * 100.0).round() as i32;
+        if ui.add(egui::Slider::new(&mut pct, 50..=200).text("VR resolution (%)")).changed() {
+            self.cfg.render_scale = pct as f32 / 100.0;
+            self.save_cfg();
+        }
+        ui.small("How sharp VRDoctor VR itself renders. Higher looks crisper but costs GPU; lower is smoother. (Game streaming resolution lives in the WiVRn app on the Quest.)");
+        ui.separator();
+
+        ui.label(egui::RichText::new("Environment (VR Home)").size(17.0).strong().color(accent()));
+        ui.small("The world you stand in inside VRDoctor VR.");
+        ui.horizontal_wrapped(|ui| {
+            for t in HOME_THEMES {
+                let label = t[..1].to_uppercase() + &t[1..];
+                if ui.selectable_label(self.set_theme == *t, label).clicked() { self.set_theme = t.to_string(); }
+            }
+        });
+        let mut bright = (self.set_brightness * 100.0).round() as i32;
+        if ui.add(egui::Slider::new(&mut bright, 50..=160).text("Brightness (%)")).changed() {
+            self.set_brightness = bright as f32 / 100.0;
+        }
+        if ui.button("🌅 Apply environment").clicked() {
+            match home_install(&self.set_theme, self.set_brightness) {
+                Ok(m) => {
+                    self.cfg.home_theme = self.set_theme.clone();
+                    self.cfg.home_brightness = self.set_brightness;
+                    self.save_cfg();
+                    self.status = m;
+                }
+                Err(e) => self.status = e,
+            }
+        }
+        ui.separator();
+
+        ui.label(egui::RichText::new("VR display fixes").size(17.0).strong().color(accent()));
+        if ui.checkbox(&mut self.cfg.flip_panel, "Panel appears upside down — flip it").changed() { self.save_cfg(); }
+        if ui.checkbox(&mut self.cfg.flip_env, "Environment appears upside down — flip it").changed() { self.save_cfg(); }
+        ui.small("You can change these inside the headset too: open VRDoctor VR and tap ⚙ Settings.");
     }
 
     fn setup_tab(&mut self, ui: &mut egui::Ui) {

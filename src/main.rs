@@ -249,11 +249,21 @@ pub(crate) struct Config {
     pub theme: String,
     /// Accent colour: "teal" (default) or "red"
     pub accent: String,
+    /// VR Home environment theme (see HOME_THEMES)
+    pub home_theme: String,
+    /// VR Home panorama brightness multiplier
+    pub home_brightness: f32,
+    /// Flip the VR panel texture (an unflipped panel shows upside down in the headset)
+    pub flip_panel: bool,
+    /// Flip the VR environment (panorama) vertically
+    pub flip_env: bool,
+    /// VRDoctor VR render resolution scale (0.5-2.0)
+    pub render_scale: f32,
     pub proton: Option<PathBuf>,
 }
 
 impl Default for Config {
-    fn default() -> Self { Self { backend: "wivrn".into(), steam_root: None, default_refresh: 90, theme: "dark".into(), accent: "teal".into(), proton: None } }
+    fn default() -> Self { Self { backend: "wivrn".into(), steam_root: None, default_refresh: 90, theme: "dark".into(), accent: "teal".into(), home_theme: "dawn".into(), home_brightness: 1.10, flip_panel: true, flip_env: false, render_scale: 1.0, proton: None } }
 }
 
 
@@ -352,6 +362,11 @@ pub(crate) fn load_config() -> Config {
                 "default_refresh" => cfg.default_refresh = v.trim().parse().unwrap_or(90),
                 "theme" => cfg.theme = v.trim().to_string(),
                 "accent" => cfg.accent = v.trim().to_string(),
+                "home_theme" => cfg.home_theme = v.trim().to_string(),
+                "home_brightness" => cfg.home_brightness = v.trim().parse().unwrap_or(1.10),
+                "flip_panel" => cfg.flip_panel = matches!(v.trim(), "1" | "true"),
+                "flip_env" => cfg.flip_env = matches!(v.trim(), "1" | "true"),
+                "render_scale" => cfg.render_scale = v.trim().parse::<f32>().unwrap_or(1.0).clamp(0.5, 2.0),
                 "proton" => cfg.proton = Some(PathBuf::from(v.trim())),
                 _ => {}
             }
@@ -363,7 +378,7 @@ pub(crate) fn load_config() -> Config {
 pub(crate) fn save_config(cfg: &Config) -> std::io::Result<PathBuf> {
     let p = config_path();
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
-    let mut s = format!("# vrdoctor config\nbackend={}\ndefault_refresh={}\ntheme={}\naccent={}\n", cfg.backend, cfg.default_refresh, cfg.theme, cfg.accent);
+    let mut s = format!("# vrdoctor config\nbackend={}\ndefault_refresh={}\ntheme={}\naccent={}\nhome_theme={}\nhome_brightness={:.2}\nflip_panel={}\nflip_env={}\nrender_scale={:.2}\n", cfg.backend, cfg.default_refresh, cfg.theme, cfg.accent, cfg.home_theme, cfg.home_brightness, cfg.flip_panel as u8, cfg.flip_env as u8, cfg.render_scale);
     if let Some(r) = &cfg.steam_root { s.push_str(&format!("steam_root={}\n", r.display())); }
     if let Some(pr) = &cfg.proton { s.push_str(&format!("proton={}\n", pr.display())); }
     fs::write(&p, s)?;
@@ -2074,7 +2089,7 @@ fn main() {
         "home" => {
             let brightness = flag_value(&args[1..], "--brightness").and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.10);
             let theme = flag_value(&args[1..], "--theme").unwrap_or_else(|| "dawn".to_string());
-            match home_install(&theme, brightness) { Ok(m) => println!("{m}"), Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
+            match home_install(&theme, brightness) { Ok(m) => { println!("{m}"); let mut c = load_config(); c.home_theme = theme.clone(); c.home_brightness = brightness; let _ = save_config(&c); }, Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
         }
         "play2d" => play2d(&args[1..]),
         "doctor" => std::process::exit(doctor()),
@@ -2149,6 +2164,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unique temp path per call — this environment's test harness can
+    /// register a test twice, and two copies running at once must not
+    /// share a PID-keyed fixture directory.
+    fn unique_temp(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()))
+    }
     #[test]
     fn detects_arch() {
         assert_eq!(parse_os_release("ID=arch\nPRETTY_NAME=\"Arch Linux\"\n").family, Family::Arch);
@@ -2223,7 +2248,7 @@ mod tests {
     }
     #[test]
     fn finds_executable_in_folder() {
-        let dir = env::temp_dir().join(format!("vrdoctor-test-{}", std::process::id()));
+        let dir = unique_temp("vrdoctor-test");
         let sub = dir.join("game");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("readme.txt"), "hi").unwrap();
@@ -2256,7 +2281,7 @@ mod tests {
     }
     #[test]
     fn panorama_renders_png() {
-        let p = env::temp_dir().join(format!("vrdoctor-pano-{}.png", std::process::id()));
+        let p = unique_temp("vrdoctor-pano").with_extension("png");
         render_panorama(&p, 1.10).unwrap();
         let data = fs::read(&p).unwrap();
         assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
@@ -2327,7 +2352,7 @@ mod tests {
 
     #[test]
     fn elf_magic_counts_as_native() {
-        let p = env::temp_dir().join(format!("vrdoctor-elf-{}", std::process::id()));
+        let p = unique_temp("vrdoctor-elf");
         fs::write(&p, [0x7f, b'E', b'L', b'F', 2, 1]).unwrap();
         assert_eq!(detect_kind(&p), GameKind::NativeExecutable);
         let _ = fs::remove_file(&p);
@@ -2369,7 +2394,7 @@ mod tests {
 
     #[test]
     fn uninstall_removes_all_user_files() {
-        let base = std::env::temp_dir().join(format!("vrdoctor-uninstall-test-{}", std::process::id()));
+        let base = unique_temp("vrdoctor-uninstall-test");
         let _ = fs::remove_dir_all(&base);
         let config = base.join("config/vrdoctor");
         let legacy = base.join("config/quest3-launcher");
