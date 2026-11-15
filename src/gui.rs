@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::{
     art_path, capture, classify_game, config_dir, current_distro, download_art, fix_openvr, home_install, install_done, launch_steam_2d, list_games,
     load_config, load_custom_games, mark_installed, quest_setup_steps, register_custom_game, remove_custom_game,
-    install_plan, run_checks, run_installer_terminal, save_config, setup_plan, setup_plan_for_family, start_backend, start_bar,
+    install_plan, register_vr_desktop, run_checks, run_installer_terminal, save_config, setup_plan, setup_plan_for_family, start_backend, start_bar,
     start_overlay, launch_custom_game, launch_steam_appid, CheckResult, Config, CustomGame, Family, Game, VrSupport,
     HOME_THEMES, SUPPORTED_KINDS,
 };
@@ -197,6 +197,10 @@ pub struct VrDoctorApp {
 
 impl VrDoctorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Keep the WiVRn launcher entry fresh on every start: upgrades
+        // from a version without the VR UI (or a moved AppImage) would
+        // otherwise leave WiVRn with no "VRDoctor VR" to list.
+        let _ = register_vr_desktop();
         let cfg = load_config();
         let dark_mode = cfg.theme != "light"; // dark is the default
         set_accent_from_config(&cfg);
