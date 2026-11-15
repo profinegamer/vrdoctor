@@ -46,6 +46,40 @@ fn sibling(name: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The program for a detached `vrdoctor` CLI call (launch, home, …).
+/// When running from the AppImage, this process lives inside a FUSE mount
+/// that disappears the moment the app exits — a detached child spawned from
+/// the mount path dies with it, silently (its stdio goes nowhere and the
+/// pages of its binary fault as the mount vanishes). That was the "pick a
+/// game in VR, the app closes, the PC does nothing" bug. Launching through
+/// $APPIMAGE instead starts a fresh AppImage instance with its own mount,
+/// which lives until the call completes. Outside the AppImage, the sibling
+/// binary is used as before.
+fn cli_program() -> PathBuf {
+    cli_program_from(env::var("APPIMAGE").ok().filter(|s| !s.is_empty()))
+}
+
+fn cli_program_from(appimage: Option<String>) -> PathBuf {
+    match appimage {
+        Some(p) => PathBuf::from(p),
+        None => sibling("vrdoctor"),
+    }
+}
+
+/// Stdio pair for a detached launch child: appends to
+/// ~/.cache/vrdoctor/vr-launch.log so a failed launch from the headset
+/// leaves a readable trace instead of vanishing into /dev/null.
+fn launch_log_stdio() -> Option<(Stdio, Stdio)> {
+    let cache = env::var("XDG_CACHE_HOME").map(PathBuf::from).ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".cache"));
+    let dir = cache.join("vrdoctor");
+    fs::create_dir_all(&dir).ok()?;
+    let f = fs::OpenOptions::new().create(true).append(true).open(dir.join("vr-launch.log")).ok()?;
+    let f2 = f.try_clone().ok()?;
+    Some((Stdio::from(f), Stdio::from(f2)))
+}
+
 /// Extract a string field from one flat JSON object (our own emitter's
 /// shape — see games_json in main.rs). Handles the standard escapes.
 fn json_str_field(obj: &str, key: &str) -> Option<String> {
@@ -1424,7 +1458,7 @@ fn activate(region: Region, panel: &mut Panel, exit_at: &mut Option<Instant>) {
             let name = THEMES[i];
             update_settings(|st| st.home_theme = name.to_string());
             let spawned = Command::new("setsid")
-                .arg(sibling("vrdoctor"))
+                .arg(cli_program())
                 .args(["home", "--theme", name])
                 .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
                 .spawn();
@@ -1469,11 +1503,15 @@ fn activate(region: Region, panel: &mut Panel, exit_at: &mut Option<Instant>) {
         Region::Launch(idx) => {
             let g = &panel.games[idx];
             let target = if g.kind == "steam" { g.appid.to_string() } else { g.name.clone() };
-            let spawned = Command::new("setsid")
-                .arg(sibling("vrdoctor"))
+            let mut cmd = Command::new("setsid");
+            cmd.arg(cli_program())
                 .args(["launch", "--game", &target])
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-                .spawn();
+                .stdin(Stdio::null());
+            match launch_log_stdio() {
+                Some((out, err)) => { cmd.stdout(out).stderr(err); }
+                None => { cmd.stdout(Stdio::null()).stderr(Stdio::null()); }
+            }
+            let spawned = cmd.spawn();
             match spawned {
                 Ok(_) => {
                     panel.status = format!("Launching {}…", g.name);
@@ -1989,5 +2027,22 @@ fn main() {
     if let Err(e) = run(&opts) {
         eprintln!("vrdoctor-vr: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_program_prefers_appimage() {
+        // Inside the AppImage, detached CLI calls must go through $APPIMAGE
+        // (a fresh mount that outlives this app), never the sibling path
+        // inside this app's own vanishing mount.
+        let p = cli_program_from(Some("/home/user/Downloads/VRDoctor-x86_64.AppImage".to_string()));
+        assert_eq!(p, PathBuf::from("/home/user/Downloads/VRDoctor-x86_64.AppImage"));
+        // No AppImage: falls back to the sibling/PATH lookup.
+        let p = cli_program_from(None);
+        assert!(p.file_name().map(|n| n == "vrdoctor").unwrap_or(false));
     }
 }

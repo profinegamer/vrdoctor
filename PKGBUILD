@@ -1,6 +1,6 @@
 # Maintainer: VRDoctor contributors
 pkgname=vrdoctor
-pkgver=0.10.1
+pkgver=0.10.2
 pkgrel=1
 pkgdesc="GUI + CLI launcher for PCVR games on Meta Quest 3 via WiVRn / ALVR, with custom non-store games"
 arch=('x86_64')
