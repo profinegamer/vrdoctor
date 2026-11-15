@@ -1469,9 +1469,38 @@ pub(crate) fn start_backend(backend: &str) -> String {
     }
 }
 
-fn apply_vr_env(cmd: &mut Command, backend: &str) {
+/// The same absolute path as seen from inside a pressure-vessel
+/// container (umu / Steam Play), which mounts the host's root
+/// filesystem at /run/host.
+fn run_host_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::from("/run/host");
+    out.push(p.strip_prefix("/").unwrap_or(p));
+    out
+}
+
+/// Decide the runtime-json path to hand a containerised launch for a
+/// given host json path: paths under $HOME are shared with the
+/// container as-is; system paths (/usr/share/…) exist inside the
+/// container only under /run/host. WiVRn's json names its library
+/// with a RELATIVE path, so it resolves against whichever json path
+/// we hand over — the /run/host form lands on the host's real
+/// runtime library, the plain form lands on a file that does not
+/// exist inside the container (→ XR_ERROR_RUNTIME_UNAVAILABLE).
+fn container_json_for(json: &Path, home: &Path) -> PathBuf {
+    if !home.as_os_str().is_empty() && json.starts_with(home) { json.to_path_buf() } else { run_host_path(json) }
+}
+
+/// The WiVRn runtime json path for a containerised (umu / Steam) launch.
+fn container_runtime_json() -> Option<PathBuf> {
+    let json = wivrn_runtime_json()?;
+    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+    Some(container_json_for(&json, &home))
+}
+
+fn apply_vr_env(cmd: &mut Command, backend: &str, container: bool) {
     if backend == "wivrn" {
-        if let Some(json) = wivrn_runtime_json() { cmd.env("XR_RUNTIME_JSON", json); }
+        let json = if container { container_runtime_json() } else { wivrn_runtime_json() };
+        if let Some(json) = json { cmd.env("XR_RUNTIME_JSON", json); }
         // Let Proton/Steam's pressure-vessel sandbox reach the WiVRn socket.
         // No SteamVR is involved anywhere in this path: OpenVR games are
         // translated by xrizer (bundled with / managed by WiVRn ≥ 0.23).
@@ -1485,7 +1514,7 @@ pub(crate) fn launch_steam_appid(appid: u64, backend: &str) -> Result<String, St
     let msg = start_backend(backend);
     let flavour = detect_steam_flavour(&load_config());
     let mut cmd = steam_launch_command(flavour, appid);
-    apply_vr_env(&mut cmd, backend);
+    apply_vr_env(&mut cmd, backend, true);
     cmd.spawn().map(|_| format!("{msg}\nLaunched Steam AppID {appid} via {}. Confirm the {backend} client is connected in the headset.", flavour.label()))
         .map_err(|e| format!("Failed to launch Steam: {e}"))
 }
@@ -1659,15 +1688,14 @@ fn launch_custom_game_impl(game: &CustomGame, cfg: &Config, mode2d: bool) -> Res
     };
     if let Some(w) = &game.workdir { cmd.current_dir(w); }
     else if let Some(parent) = game.path.parent() { if kind != GameKind::DesktopEntry { cmd.current_dir(parent); } }
-    // umu launches must keep the plain environment. Forcing
-    // XR_RUNTIME_JSON / PRESSURE_VESSEL_FILESYSTEMS_RW into umu's
-    // container made the OpenXR runtime unreachable there — proven on
-    // real hardware: SUPERHOT VR under VRDoctor+umu died with
-    // XR_ERROR_RUNTIME_UNAVAILABLE in its first 90 ms, while the same
-    // game launched by hand (umu, no extra vars) reached VR. The bare
-    // Proton route has no container and keeps the env; it connected
-    // fine with it, so only the umu route skips it.
-    if !mode2d && !used_umu { apply_vr_env(&mut cmd, &backend); }
+    // Containerised routes (umu, and Steam via launch_steam_appid)
+    // must get the /run/host form of the runtime json — the plain
+    // host path does not exist inside the container's own /usr, and
+    // the game then dies with XR_ERROR_RUNTIME_UNAVAILABLE (proven
+    // on real hardware via SUPERHOT VR's Player.log, in both the
+    // plain-path and no-variable configurations). The bare Proton
+    // route runs on the host filesystem and keeps the plain path.
+    if !mode2d { apply_vr_env(&mut cmd, &backend, used_umu); }
     let how = {
         let base = match kind {
             GameKind::WindowsInstaller => " (installer — follow its setup, then add the installed game)",
@@ -2638,6 +2666,19 @@ mod tests {
         assert!(is_helper_exe(&game_dir.join("UnityCrashHandler64.exe")));
         assert!(!is_helper_exe(&game_dir.join("SUPERHOT_VR.exe")));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn container_runtime_json_mapping() {
+        let home = Path::new("/home/shymoth");
+        // System json: only reachable inside a container via /run/host.
+        assert_eq!(container_json_for(Path::new("/usr/share/openxr/1/openxr_wivrn.json"), home),
+                   PathBuf::from("/run/host/usr/share/openxr/1/openxr_wivrn.json"));
+        // Json under $HOME (Flatpak WiVRn): shared with the container as-is.
+        assert_eq!(container_json_for(Path::new("/home/shymoth/.local/share/flatpak/app/io.github.wivrn.wivrn/current/active/files/share/openxr/1/openxr_wivrn.json"), home),
+                   PathBuf::from("/home/shymoth/.local/share/flatpak/app/io.github.wivrn.wivrn/current/active/files/share/openxr/1/openxr_wivrn.json"));
+        assert_eq!(run_host_path(Path::new("/usr/lib/wivrn/libopenxr_wivrn.so")),
+                   PathBuf::from("/run/host/usr/lib/wivrn/libopenxr_wivrn.so"));
     }
 
     #[test]
