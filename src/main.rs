@@ -259,11 +259,15 @@ pub(crate) struct Config {
     pub flip_env: bool,
     /// VRDoctor VR render resolution scale (0.5-2.0)
     pub render_scale: f32,
+    /// VR panel size multiplier (0.7-1.4) — owned by the VR app's
+    /// Settings page; the desktop struct only carries it so a desktop
+    /// save_config round-trip doesn't silently drop it.
+    pub panel_size: f32,
     pub proton: Option<PathBuf>,
 }
 
 impl Default for Config {
-    fn default() -> Self { Self { backend: "wivrn".into(), steam_root: None, default_refresh: 90, theme: "dark".into(), accent: "teal".into(), home_theme: "dawn".into(), home_brightness: 1.10, flip_panel: true, flip_env: false, render_scale: 1.0, proton: None } }
+    fn default() -> Self { Self { backend: "wivrn".into(), steam_root: None, default_refresh: 90, theme: "dark".into(), accent: "teal".into(), home_theme: "dawn".into(), home_brightness: 1.10, flip_panel: true, flip_env: false, render_scale: 1.0, panel_size: 1.0, proton: None } }
 }
 
 
@@ -367,6 +371,7 @@ pub(crate) fn load_config() -> Config {
                 "flip_panel" => cfg.flip_panel = matches!(v.trim(), "1" | "true"),
                 "flip_env" => cfg.flip_env = matches!(v.trim(), "1" | "true"),
                 "render_scale" => cfg.render_scale = v.trim().parse::<f32>().unwrap_or(1.0).clamp(0.5, 2.0),
+                "panel_size" => cfg.panel_size = v.trim().parse::<f32>().unwrap_or(1.0).clamp(0.7, 1.4),
                 "proton" => cfg.proton = Some(PathBuf::from(v.trim())),
                 _ => {}
             }
@@ -378,7 +383,7 @@ pub(crate) fn load_config() -> Config {
 pub(crate) fn save_config(cfg: &Config) -> std::io::Result<PathBuf> {
     let p = config_path();
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
-    let mut s = format!("# vrdoctor config\nbackend={}\ndefault_refresh={}\ntheme={}\naccent={}\nhome_theme={}\nhome_brightness={:.2}\nflip_panel={}\nflip_env={}\nrender_scale={:.2}\n", cfg.backend, cfg.default_refresh, cfg.theme, cfg.accent, cfg.home_theme, cfg.home_brightness, cfg.flip_panel as u8, cfg.flip_env as u8, cfg.render_scale);
+    let mut s = format!("# vrdoctor config\nbackend={}\ndefault_refresh={}\ntheme={}\naccent={}\nhome_theme={}\nhome_brightness={:.2}\nflip_panel={}\nflip_env={}\nrender_scale={:.2}\npanel_size={:.2}\n", cfg.backend, cfg.default_refresh, cfg.theme, cfg.accent, cfg.home_theme, cfg.home_brightness, cfg.flip_panel as u8, cfg.flip_env as u8, cfg.render_scale, cfg.panel_size);
     if let Some(r) = &cfg.steam_root { s.push_str(&format!("steam_root={}\n", r.display())); }
     if let Some(pr) = &cfg.proton { s.push_str(&format!("proton={}\n", pr.display())); }
     fs::write(&p, s)?;
