@@ -737,6 +737,9 @@ impl VrDoctorApp {
     fn save_cfg(&mut self) { let _ = save_config(&self.cfg); }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        // The tab is taller than most windows: without a ScrollArea the
+        // lower sections are simply unreachable — no mouse-wheel scroll.
+        egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("Settings");
         ui.small("Changes save automatically and are shared with VRDoctor VR in the headset.");
         ui.separator();
@@ -822,6 +825,7 @@ impl VrDoctorApp {
             ui.label("✅ You're up to date.");
         }
         self.update_strip(ui);
+        });
     }
 
     fn setup_tab(&mut self, ui: &mut egui::Ui) {
