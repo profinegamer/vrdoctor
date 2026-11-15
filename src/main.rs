@@ -1497,9 +1497,10 @@ fn proton_dir_of(proton_script: &Path) -> PathBuf {
     proton_script.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf()).unwrap_or_else(|| proton_script.to_path_buf())
 }
 
-/// Build a Proton/Wine command for a Windows file (.exe / .bat / .msi),
-/// plus a short note naming the route taken ("" when nothing noteworthy).
-fn windows_command(game: &CustomGame, cfg: &Config, kind: GameKind, args: &[String]) -> Result<(Command, String), String> {
+/// Build a Proton/Wine command for a Windows file (.exe / .bat / .msi).
+/// Returns the command, a short note naming the route taken ("" when
+/// nothing noteworthy), and whether the umu route was used.
+fn windows_command(game: &CustomGame, cfg: &Config, kind: GameKind, args: &[String]) -> Result<(Command, String, bool), String> {
     let proton = if !game.proton.is_empty() { Some(PathBuf::from(&game.proton)) } else { find_proton(cfg) };
     if let Some(proton) = proton {
         let compat = config_dir().join("compatdata").join(sanitize_name(&game.name));
@@ -1515,7 +1516,7 @@ fn windows_command(game: &CustomGame, cfg: &Config, kind: GameKind, args: &[Stri
             cmd.env("GAMEID", sanitize_name(&game.name));
             cmd.env("WINEPREFIX", &compat);
             cmd.env("PROTONPATH", proton_dir_of(&proton));
-            return Ok((cmd, "via umu-launcher (Steam runtime container)".to_string()));
+            return Ok((cmd, "via umu-launcher (Steam runtime container)".to_string(), true));
         }
         let mut cmd = Command::new(&proton);
         cmd.arg("run").arg(&game.path).args(args);
@@ -1523,7 +1524,7 @@ fn windows_command(game: &CustomGame, cfg: &Config, kind: GameKind, args: &[Stri
         let root = steam_roots(cfg).into_iter().next()
             .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share/Steam"));
         cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", root);
-        return Ok((cmd, String::new()));
+        return Ok((cmd, String::new(), false));
     }
     if let Some(wine) = which("wine") {
         let mut cmd = Command::new(wine);
@@ -1532,7 +1533,7 @@ fn windows_command(game: &CustomGame, cfg: &Config, kind: GameKind, args: &[Stri
             GameKind::WindowsInstaller => { cmd.arg("msiexec").arg("/i").arg(&game.path).args(args); }
             _ => { cmd.arg(&game.path).args(args); }
         }
-        return Ok((cmd, String::new()));
+        return Ok((cmd, String::new(), false));
     }
     Err(format!("'{}' is a Windows file but no Proton or Wine was found. Install the game once via Steam (Add a Non-Steam Game) so Proton exists, set a Proton path in the GUI/CLI, or install Wine.", game.name))
 }
@@ -1631,10 +1632,12 @@ fn launch_custom_game_impl(game: &CustomGame, cfg: &Config, mode2d: bool) -> Res
     } else { start_backend(&backend) };
     let args = split_args(&game.args);
     let mut route_note = String::new();
+    let mut used_umu = false;
     let mut cmd = match kind {
         GameKind::WindowsExe | GameKind::WindowsBatch | GameKind::WindowsInstaller => {
-            let (c, note) = windows_command(game, cfg, kind, &args)?;
+            let (c, note, umu) = windows_command(game, cfg, kind, &args)?;
             route_note = note;
+            used_umu = umu;
             c
         }
         GameKind::ShellScript | GameKind::Python | GameKind::Perl | GameKind::Ruby | GameKind::Node | GameKind::Jar | GameKind::Love => interpreter_command(game, kind, &args)?,
@@ -1656,7 +1659,15 @@ fn launch_custom_game_impl(game: &CustomGame, cfg: &Config, mode2d: bool) -> Res
     };
     if let Some(w) = &game.workdir { cmd.current_dir(w); }
     else if let Some(parent) = game.path.parent() { if kind != GameKind::DesktopEntry { cmd.current_dir(parent); } }
-    if !mode2d { apply_vr_env(&mut cmd, &backend); }
+    // umu launches must keep the plain environment. Forcing
+    // XR_RUNTIME_JSON / PRESSURE_VESSEL_FILESYSTEMS_RW into umu's
+    // container made the OpenXR runtime unreachable there — proven on
+    // real hardware: SUPERHOT VR under VRDoctor+umu died with
+    // XR_ERROR_RUNTIME_UNAVAILABLE in its first 90 ms, while the same
+    // game launched by hand (umu, no extra vars) reached VR. The bare
+    // Proton route has no container and keeps the env; it connected
+    // fine with it, so only the umu route skips it.
+    if !mode2d && !used_umu { apply_vr_env(&mut cmd, &backend); }
     let how = {
         let base = match kind {
             GameKind::WindowsInstaller => " (installer — follow its setup, then add the installed game)",
