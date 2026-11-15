@@ -1,0 +1,5 @@
+NAME="Arch Linux"
+PRETTY_NAME="Arch Linux"
+ID=arch
+ID_LIKE=
+BUILD_ID=rolling

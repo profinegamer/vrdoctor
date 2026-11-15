@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=VRDoctor
+Comment=Play PC VR games on Meta Quest 3 (WiVRn / ALVR) — Steam and custom games
+Exec=vrdoctor gui
+Icon=input-gaming
+Terminal=false
+Type=Application
+Categories=Game;Utility;

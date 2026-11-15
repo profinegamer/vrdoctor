@@ -1,0 +1,22 @@
+# 20 free Steam games used to test VRDoctor's VR/2D auto-detection.
+# Columns: appid <TAB> name <TAB> expected (VR | VR+2D | 2D). All free-to-play.
+450390	The Lab	VR
+348250	Google Earth VR	VR
+518580	Accounting	VR
+1363430	Propagation VR	VR
+381940	Trials on Tatooine	VR
+868020	Aperture Hand Lab	VR
+468700	NVIDIA VR Funhouse	VR
+457550	Bigscreen Beta	VR
+438100	VRChat	VR+2D
+471710	Rec Room	VR+2D
+223750	DCS World	VR+2D
+236390	War Thunder	VR+2D
+570	Dota 2	2D
+730	Counter-Strike 2	2D
+304930	Unturned	2D
+1172470	Apex Legends	2D
+1085660	Destiny 2	2D
+230410	Warframe	2D
+238960	Path of Exile	2D
+291550	Brawlhalla	2D

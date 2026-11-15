@@ -1,0 +1,5 @@
+NAME="Fedora Linux"
+PRETTY_NAME="Fedora Linux 41 (Workstation Edition)"
+ID=fedora
+ID_LIKE=
+VERSION_ID=41

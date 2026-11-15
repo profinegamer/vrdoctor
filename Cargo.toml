@@ -1,0 +1,27 @@
+[package]
+name = "vrdoctor"
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+description = "VRDoctor — Linux launcher for PCVR games on Meta Quest 3 (Arch & Fedora) via WiVRn / ALVR / Steam Link, with a dark-mode GUI and custom (non-store) games"
+rust-version = "1.74"
+
+[[bin]]
+name = "vrdoctor"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }
+# Pure-Rust PNG encoder, used to procedurally render the VR Home panorama.
+png = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
