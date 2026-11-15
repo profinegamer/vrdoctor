@@ -325,6 +325,121 @@ fn uninstall_targets() -> Vec<PathBuf> {
     v
 }
 
+
+// ---------------------------------------------------------------- updates
+
+/// A newer release found on GitHub.
+#[derive(Debug, Clone)]
+pub(crate) struct UpdateInfo {
+    pub version: String, // e.g. "0.10.0" (no leading v)
+    pub url: String,     // browser_download_url of the AppImage asset
+}
+
+/// Parse "0.9.1" / "v0.9.1" into a comparable tuple.
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let s = s.trim().trim_start_matches('v');
+    let mut it = s.split('.');
+    let a = it.next()?.parse().ok()?;
+    let b = it.next()?.parse().ok()?;
+    let c = it.next()?.parse().ok()?;
+    if it.next().is_some() { return None; }
+    Some((a, b, c))
+}
+
+/// The string value of the first `"key": "value"` in a JSON blob
+/// (GitHub's API shape is stable; the project hand-rolls JSON elsewhere too).
+fn json_string(json: &str, key: &str) -> Option<String> {
+    // GitHub's API emits compact JSON ("key":"value", no space).
+    let pat = format!("\"{key}\":");
+    let rest = json[json.find(&pat)? + pat.len()..].trim_start();
+    let rest = rest.strip_prefix('\"')?;
+    let end = rest.find('\"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract (tag, AppImage URL) from a GitHub "latest release" payload.
+fn release_update(json: &str) -> Option<UpdateInfo> {
+    let tag = json_string(json, "tag_name")?;
+    // Find the AppImage asset first, then its download URL (the URL key
+    // appears after the name key inside the same asset object).
+    let asset_at = json.find("VRDoctor-x86_64.AppImage")?;
+    let url = json_string(&json[asset_at..], "browser_download_url")?;
+    Some(UpdateInfo { version: tag.trim_start_matches('v').to_string(), url })
+}
+
+/// Ask GitHub for the latest release; Ok(Some) when it's newer than us.
+pub(crate) fn check_for_update() -> Result<Option<UpdateInfo>, String> {
+    let out = Command::new("curl")
+        .args(["-fsSL", "--max-time", "15", "-A", "vrdoctor-updater",
+               "https://api.github.com/repos/profinegamer/vrdoctor/releases/latest"])
+        .output()
+        .map_err(|e| format!("could not run curl: {e}"))?;
+    if !out.status.success() {
+        return Err("GitHub could not be reached (offline, or rate-limited for a while)".into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let info = release_update(&text).ok_or("could not read GitHub's release answer")?;
+    let newer = match (parse_version(&info.version), parse_version(env!("CARGO_PKG_VERSION"))) {
+        (Some(latest), Some(current)) => latest > current,
+        _ => false,
+    };
+    Ok(if newer { Some(info) } else { None })
+}
+
+/// Download the release AppImage and atomically replace the running one.
+/// Only meaningful when launched from the AppImage ($APPIMAGE is set).
+pub(crate) fn apply_update(info: &UpdateInfo) -> Result<String, String> {
+    let appimage = env::var("APPIMAGE")
+        .map_err(|_| "not running from an AppImage — grab the new one from GitHub releases instead".to_string())?;
+    let target = PathBuf::from(&appimage);
+    let dir = target.parent().ok_or("the AppImage path has no parent folder")?;
+    let tmp = dir.join("VRDoctor-update.tmp");
+    let _ = fs::remove_file(&tmp);
+    let status = Command::new("curl")
+        .args(["-fL", "--max-time", "900", "-o"])
+        .arg(&tmp)
+        .arg(&info.url)
+        .status()
+        .map_err(|e| format!("could not run curl: {e}"))?;
+    if !status.success() {
+        let _ = fs::remove_file(&tmp);
+        return Err("the download failed — check your connection and try again".into());
+    }
+    // Sanity: an AppImage is an ELF at least a megabyte in size.
+    let head = fs::read(&tmp).unwrap_or_default();
+    if head.len() < 1_000_000 || head.get(..4) != Some(&[0x7f, b'E', b'L', b'F'][..]) {
+        let _ = fs::remove_file(&tmp);
+        return Err("the download didn't look like a VRDoctor AppImage, so nothing was changed".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755));
+    }
+    fs::rename(&tmp, &target).map_err(|e| format!("could not replace the old AppImage: {e}"))?;
+    Ok(format!("Updated to v{} — restart VRDoctor to use it.", info.version))
+}
+
+fn cmd_update(args: &[String]) {
+    let check_only = args.iter().any(|a| a == "--check");
+    println!("Checking GitHub for a newer VRDoctor…");
+    match check_for_update() {
+        Ok(Some(info)) => {
+            println!("v{} is available (you have v{}).", info.version, env!("CARGO_PKG_VERSION"));
+            if check_only {
+                println!("Download it from https://github.com/profinegamer/vrdoctor/releases/latest — or run `vrdoctor update` and I'll fetch it.");
+                return;
+            }
+            match apply_update(&info) {
+                Ok(m) => println!("{m}"),
+                Err(e) => { eprintln!("Update failed: {e}"); std::process::exit(1); }
+            }
+        }
+        Ok(None) => println!("You're up to date (v{}).", env!("CARGO_PKG_VERSION")),
+        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+    }
+}
+
 fn cmd_uninstall(args: &[String]) {
     if !args.iter().any(|a| a == "--yes") {
         let targets = uninstall_targets();
@@ -2050,6 +2165,7 @@ USAGE:
   vrdoctor fix-openvr [--undo]      Stop a (broken) SteamVR from hijacking OpenVR games — route them to WiVRn/xrizer
   vrdoctor fix-steam              Let Flatpak Steam see WiVRn (sandbox overrides + runtime symlink) so games open in the headset, not flat on the monitor
   vrdoctor uninstall [--yes]      Remove VRDoctor's own files (settings, caches, menu entries); without --yes it only lists what would go
+  vrdoctor update [--check]       Update the AppImage in place from GitHub releases (--check only reports)
   vrdoctor list-games [--online]    Steam games grouped VR / VR+2D / 2D + custom (non-store) games
   vrdoctor list-games --json        The same list as JSON (used by vrdoctor-vr, the in-headset UI)
   vrdoctor vr [--register-only]     Open the VRDoctor library inside the headset (a real OpenXR app
@@ -2153,6 +2269,7 @@ fn main() {
         }
         "vr" => cmd_vr(&args[1..]),
         "uninstall" => cmd_uninstall(&args[1..]),
+        "update" => cmd_update(&args[1..]),
         "add-game" => add_game_cli(&args[1..]),
         "remove-game" => remove_game_cli(&args[1..]),
         "launch" | "play" => launch(&args[1..]),
@@ -2396,6 +2513,29 @@ mod tests {
     }
 
     #[test]
+
+    #[test]
+
+    #[test]
+    fn version_parsing_and_ordering() {
+        assert_eq!(parse_version("0.9.1"), Some((0, 9, 1)));
+        assert_eq!(parse_version("v0.10.0"), Some((0, 10, 0)));
+        assert_eq!(parse_version("1.0"), None);
+        assert!(parse_version("0.10.0") > parse_version("0.9.1"));
+        assert!(parse_version("0.9.1") > parse_version("0.9.0"));
+    }
+
+    #[test]
+    fn release_payload_parsing() {
+        let json = r#"{"tag_name":"v0.10.0","assets":[
+            {"name":"notes.txt","browser_download_url":"https://example.com/notes"},
+            {"name":"VRDoctor-x86_64.AppImage","browser_download_url":"https://example.com/VRDoctor-x86_64.AppImage"}
+        ]}"#;
+        let info = release_update(json).unwrap();
+        assert_eq!(info.version, "0.10.0");
+        assert_eq!(info.url, "https://example.com/VRDoctor-x86_64.AppImage");
+        assert!(release_update("{}").is_none());
+    }
 
     #[test]
     fn uninstall_removes_all_user_files() {

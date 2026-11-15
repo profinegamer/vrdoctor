@@ -116,6 +116,23 @@ vrdoctor vr --register-only  # just (re)write the WiVRn launcher entry
 
 Under the hood it's a native OpenXR app (`vrdoctor-vr`, OpenGL via EGL) that reads the same library as the desktop app — Steam games are sorted VR-first, custom games included. WiVRn finds it through a desktop entry with the `X-WiVRn-VR` category in `~/.local/share/applications` (written by the installer, by `vrdoctor vr`, or shipped by the packages). Honest status: confirmed working on a real Quest 3 over WiVRn (first real-hardware run found the panel rendering upside down — fixed in v0.9.0 with a default-on texture flip, toggleable in Settings).
 
+## Updating
+
+VRDoctor updates itself. The app checks GitHub on startup; when a newer
+release exists, a banner offers **Download & install**, then **Restart
+now**. You can also check manually in **Settings → Updates**, or from
+the terminal:
+
+```bash
+vrdoctor update          # check + download + replace the AppImage in place
+vrdoctor update --check  # only tell me if there's a new version
+```
+
+The update downloads the new AppImage, sanity-checks it (ELF, sane
+size) and atomically replaces the old file — your settings, library
+and custom games are untouched. (Self-update works for the AppImage
+build; package installs update through their package manager.)
+
 ## Settings (PC tab + in-headset page)
 
 Both apps share one settings file (`~/.config/vrdoctor/config.conf`) and

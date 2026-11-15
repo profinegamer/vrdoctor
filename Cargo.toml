@@ -1,6 +1,6 @@
 [package]
 name = "vrdoctor"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 description = "VRDoctor — Linux launcher for PCVR games on Meta Quest 3 (Arch & Fedora) via WiVRn / ALVR / Steam Link, with a dark-mode GUI and custom (non-store) games"

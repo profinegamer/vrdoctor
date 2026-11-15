@@ -4,13 +4,14 @@
 
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::{
     art_path, capture, classify_game, current_distro, download_art, fix_openvr, home_install, install_done, launch_steam_2d, list_games,
     load_config, load_custom_games, mark_installed, quest_setup_steps, register_custom_game, remove_custom_game,
     install_plan, register_vr_desktop, run_checks, uninstall_user_files, run_installer_terminal, save_config, setup_plan, setup_plan_for_family, start_backend, start_bar,
     start_overlay, launch_custom_game, launch_steam_appid, CheckResult, Config, CustomGame, Family, Game, VrSupport,
-    HOME_THEMES, SUPPORTED_KINDS,
+    apply_update, check_for_update, UpdateInfo, HOME_THEMES, SUPPORTED_KINDS,
 };
 
 // ------------------------------------------------------------ visual theme
@@ -110,6 +111,43 @@ enum Pending { Steam(u64), Steam2d(u64), Custom(CustomGame) }
 
 
 /// Background-download missing Steam cover art, then ask for a repaint.
+
+/// Built-in updater state, shared between the UI and its worker threads.
+enum UpdateUi {
+    Idle,
+    Checking,
+    Available(UpdateInfo),
+    Downloading,
+    Installed(String),
+    UpToDate,
+    Failed(String),
+}
+
+fn spawn_update_check(ctx: &egui::Context, state: Arc<Mutex<UpdateUi>>, manual: bool) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let next = match check_for_update() {
+            Ok(Some(info)) => UpdateUi::Available(info),
+            Ok(None) => if manual { UpdateUi::UpToDate } else { UpdateUi::Idle },
+            Err(e) => if manual { UpdateUi::Failed(e) } else { UpdateUi::Idle },
+        };
+        if let Ok(mut g) = state.lock() { *g = next; }
+        ctx.request_repaint();
+    });
+}
+
+fn spawn_update_apply(ctx: &egui::Context, state: Arc<Mutex<UpdateUi>>, info: UpdateInfo) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let next = match apply_update(&info) {
+            Ok(m) => UpdateUi::Installed(m),
+            Err(e) => UpdateUi::Failed(e),
+        };
+        if let Ok(mut g) = state.lock() { *g = next; }
+        ctx.request_repaint();
+    });
+}
+
 fn spawn_art_download(ctx: &egui::Context, appids: Vec<u64>) {
     let ctx = ctx.clone();
     std::thread::spawn(move || {
@@ -169,6 +207,7 @@ pub struct VrDoctorApp {
     /// lag badly on real libraries.
     vr_info: std::collections::HashMap<u64, (VrSupport, String)>,
     confirm_uninstall: bool,
+    update: Arc<Mutex<UpdateUi>>,
     set_theme: String,
     set_brightness: f32,
 }
@@ -186,6 +225,8 @@ impl VrDoctorApp {
         let backend = cfg.backend.clone();
         let games = list_games(&cfg);
         spawn_art_download(&cc.egui_ctx, games.iter().map(|g| g.appid).collect());
+        let update: Arc<Mutex<UpdateUi>> = Arc::new(Mutex::new(UpdateUi::Checking));
+        spawn_update_check(&cc.egui_ctx, update.clone(), false);
         let vr_info = games.iter().map(|g| (g.appid, classify_game(g, false))).collect();
         let accent_red = cfg.accent == "red";
         let set_theme = cfg.home_theme.clone();
@@ -218,6 +259,7 @@ impl VrDoctorApp {
             art_bad: std::collections::HashSet::new(),
             vr_info,
             confirm_uninstall: false,
+            update,
             set_theme,
             set_brightness,
         }
@@ -307,6 +349,7 @@ impl eframe::App for VrDoctorApp {
                 ui.selectable_value(&mut self.tab, Tab::Setup, "⚙ Setup");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "🎛 Settings");
             });
+            self.update_strip(ui);
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| { ui.label(&self.status); });
@@ -643,6 +686,54 @@ impl VrDoctorApp {
     }
 
 
+
+    /// The updater's little strip: shows only when there's something to
+    /// say (an update is available / downloading / installed). Used in
+    /// the header and in the Settings tab.
+    fn update_strip(&mut self, ui: &mut egui::Ui) {
+        // Snapshot the state so the lock isn't held while drawing.
+        enum Act { None, Offer(UpdateInfo), Busy, Done(String), Failed(String) }
+        let act = match self.update.lock() {
+            Ok(g) => match &*g {
+                UpdateUi::Available(info) => Act::Offer(info.clone()),
+                UpdateUi::Downloading => Act::Busy,
+                UpdateUi::Installed(m) => Act::Done(m.clone()),
+                UpdateUi::Failed(e) => Act::Failed(e.clone()),
+                _ => Act::None,
+            },
+            Err(_) => Act::None,
+        };
+        match act {
+            Act::Offer(info) => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("⬆ VRDoctor v{} is available", info.version)).strong().color(accent()));
+                    if std::env::var("APPIMAGE").is_ok() {
+                        if ui.button("Download & install").clicked() {
+                            if let Ok(mut g) = self.update.lock() { *g = UpdateUi::Downloading; }
+                            spawn_update_apply(ui.ctx(), self.update.clone(), info.clone());
+                        }
+                    } else {
+                        ui.label("— get it from github.com/profinegamer/vrdoctor/releases");
+                    }
+                });
+            }
+            Act::Busy => { ui.label("⬆ Downloading the update…"); }
+            Act::Done(msg) => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("✅ {msg}")).color(accent()));
+                    if ui.button("Restart now").clicked() {
+                        if let Ok(appimage) = std::env::var("APPIMAGE") {
+                            let _ = std::process::Command::new(appimage).spawn();
+                        }
+                        std::process::exit(0);
+                    }
+                });
+            }
+            Act::Failed(e) => { ui.label(format!("⬆ Update problem: {e}")); }
+            Act::None => {}
+        }
+    }
+
     fn save_cfg(&mut self) { let _ = save_config(&self.cfg); }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -714,6 +805,23 @@ impl VrDoctorApp {
         if ui.checkbox(&mut self.cfg.flip_panel, "Panel appears upside down — flip it").changed() { self.save_cfg(); }
         if ui.checkbox(&mut self.cfg.flip_env, "Environment appears upside down — flip it").changed() { self.save_cfg(); }
         ui.small("You can change these inside the headset too: open VRDoctor VR and tap ⚙ Settings.");
+        ui.separator();
+
+        ui.label(egui::RichText::new("Updates").size(17.0).strong().color(accent()));
+        ui.horizontal(|ui| {
+            ui.label(format!("You have VRDoctor v{}.", env!("CARGO_PKG_VERSION")));
+            let checking = matches!(self.update.lock().map(|g| matches!(*g, UpdateUi::Checking)), Ok(true));
+            if checking {
+                ui.label("Checking…");
+            } else if ui.button("Check for updates").clicked() {
+                if let Ok(mut g) = self.update.lock() { *g = UpdateUi::Checking; }
+                spawn_update_check(ui.ctx(), self.update.clone(), true);
+            }
+        });
+        if matches!(self.update.lock().map(|g| matches!(*g, UpdateUi::UpToDate)), Ok(true)) {
+            ui.label("✅ You're up to date.");
+        }
+        self.update_strip(ui);
     }
 
     fn setup_tab(&mut self, ui: &mut egui::Ui) {
