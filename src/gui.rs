@@ -6,7 +6,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 use crate::{
-    capture, classify_game, current_distro, fix_openvr, home_install, install_done, launch_steam_2d, list_games,
+    art_path, capture, classify_game, current_distro, download_art, fix_openvr, home_install, install_done, launch_steam_2d, list_games,
     load_config, load_custom_games, mark_installed, quest_setup_steps, register_custom_game, remove_custom_game,
     run_checks, run_installer_terminal, save_config, setup_plan, setup_plan_for_family, start_backend, start_bar,
     start_overlay, launch_custom_game, launch_steam_appid, CheckResult, Config, CustomGame, Family, Game, VrSupport,
@@ -91,6 +91,36 @@ fn card<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab { Games, Doctor, AddGame, Shell, Setup }
 
+/// A launch requested by a tile, card or the detail bar — acted on after
+/// the UI pass so borrows stay simple.
+enum Pending { Steam(u64), Steam2d(u64), Custom(CustomGame) }
+
+/// Background-download missing Steam cover art, then ask for a repaint.
+fn spawn_art_download(ctx: &egui::Context, appids: Vec<u64>) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        for id in appids { if !art_path(id).exists() { download_art(id); } }
+        ctx.request_repaint();
+    });
+}
+
+/// Placeholder tile colour, picked from a muted jewel-tone palette.
+fn tile_color(seed: u64) -> egui::Color32 {
+    const PALETTE: [(u8, u8, u8); 8] = [
+        (30, 64, 175), (21, 101, 52), (88, 28, 175), (154, 52, 18),
+        (14, 116, 144), (134, 25, 143), (133, 77, 14), (51, 65, 85),
+    ];
+    let (r, g, b) = PALETTE[(seed % 8) as usize];
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn truncate_name(name: &str, max: usize) -> String {
+    if name.chars().count() <= max { return name.to_string(); }
+    let mut out: String = name.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
 pub struct VrDoctorApp {
     cfg: Config,
     dark_mode: bool,
@@ -111,6 +141,13 @@ pub struct VrDoctorApp {
     f_mode: String,
     brightness: f32,
     home_theme: String,
+    // Library (Steam-style grid)
+    grid_view: bool,
+    selected_steam: Option<u64>,
+    selected_custom: Option<String>,
+    pending: Option<Pending>,
+    textures: std::collections::HashMap<u64, egui::TextureHandle>,
+    art_bad: std::collections::HashSet<u64>,
 }
 
 impl VrDoctorApp {
@@ -119,8 +156,10 @@ impl VrDoctorApp {
         let dark_mode = cfg.theme != "light"; // dark is the default
         apply_polish(&cc.egui_ctx, dark_mode);
         let backend = cfg.backend.clone();
+        let games = list_games(&cfg);
+        spawn_art_download(&cc.egui_ctx, games.iter().map(|g| g.appid).collect());
         Self {
-            steam_games: list_games(&cfg),
+            steam_games: games,
             custom_games: load_custom_games(),
             cfg,
             dark_mode,
@@ -138,6 +177,32 @@ impl VrDoctorApp {
             f_mode: "vr".to_string(),
             brightness: 1.10,
             home_theme: "dawn".into(),
+            grid_view: true,
+            selected_steam: None,
+            selected_custom: None,
+            pending: None,
+            textures: std::collections::HashMap::new(),
+            art_bad: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Load (once) and return the cover-art texture for a Steam game.
+    fn texture_for(&mut self, ctx: &egui::Context, appid: u64) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.textures.get(&appid) { return Some(t.clone()); }
+        if self.art_bad.contains(&appid) { return None; }
+        let path = art_path(appid);
+        if !path.exists() { return None; }
+        match image::open(&path) {
+            Ok(img) => {
+                let img = if img.width() > 600 { img.resize(600, 900, image::imageops::FilterType::Triangle) } else { img };
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                let tex = ctx.load_texture(format!("art-{appid}"), ci, egui::TextureOptions::LINEAR);
+                self.textures.insert(appid, tex.clone());
+                Some(tex)
+            }
+            Err(_) => { self.art_bad.insert(appid); None }
         }
     }
 
@@ -202,18 +267,162 @@ impl eframe::App for VrDoctorApp {
 impl VrDoctorApp {
     fn games_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            ui.heading("🎮 Library");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.selectable_value(&mut self.grid_view, false, "☰ List");
+                ui.selectable_value(&mut self.grid_view, true, "▦ Grid");
+                if ui.button("🎨 Fetch cover art").clicked() {
+                    spawn_art_download(ui.ctx(), self.steam_games.iter().map(|g| g.appid).collect());
+                    self.status = "Fetching cover art from Steam in the background…".into();
+                }
+                if ui.button("🔍 Check Steam online (VR or 2D?)").clicked() {
+                    let mut known = 0;
+                    for g in &self.steam_games { if classify_game(g, true).0 != VrSupport::Unknown { known += 1; } }
+                    self.status = format!("Checked Steam: {known}/{} games classified. Badges: VR = VR-only · VR+2D = plays both ways · 2D = flat game · ? = not checked.", self.steam_games.len());
+                }
+            });
+        });
+        ui.horizontal(|ui| {
             ui.label("Search:");
             ui.text_edit_singleline(&mut self.search);
         });
         let needle = self.search.to_lowercase();
+        self.detail_bar(ui);
+        ui.separator();
+        if self.grid_view { self.library_grid(ui, &needle); } else { self.library_list(ui, &needle); }
+        if let Some(p) = self.pending.take() {
+            match p {
+                Pending::Steam(appid) => { self.status = match launch_steam_appid(appid, &self.backend.clone()) { Ok(m) => m, Err(e) => e }; }
+                Pending::Steam2d(appid) => { self.status = match launch_steam_2d(appid, &self.backend.clone()) { Ok(m) => m, Err(e) => e }; }
+                Pending::Custom(mut g) => {
+                    if g.backend.is_empty() { g.backend = self.backend.clone(); }
+                    self.status = match launch_custom_game(&g, &self.cfg) { Ok(m) => m, Err(e) => e };
+                }
+            }
+        }
+    }
 
+    /// Steam-style detail strip for the currently selected game.
+    fn detail_bar(&mut self, ui: &mut egui::Ui) {
+        if let Some(appid) = self.selected_steam {
+            if let Some(g) = self.steam_games.iter().find(|g| g.appid == appid).cloned() {
+                let (sup, src) = classify_game(&g, false);
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(&g.name).size(19.0).strong());
+                            ui.horizontal(|ui| {
+                                badge(ui, sup);
+                                ui.small(format!("AppID {} · detected via {} · backend: {}", g.appid, src, self.backend));
+                            });
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").clicked() { self.selected_steam = None; }
+                            if ui.button("▶ 2D").clicked() { self.pending = Some(Pending::Steam2d(g.appid)); }
+                            let launch = egui::Button::new(egui::RichText::new("▶ Launch").strong().color(egui::Color32::from_rgb(6, 24, 22))).fill(ACCENT);
+                            if ui.add(launch).clicked() { self.pending = Some(Pending::Steam(g.appid)); }
+                        });
+                    });
+                });
+            }
+        } else if let Some(name) = self.selected_custom.clone() {
+            if let Some(g) = self.custom_games.iter().find(|g| g.name == name).cloned() {
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(&g.name).size(19.0).strong());
+                            ui.small(format!("Custom game · {}{}", g.path.display(), if g.mode == "2d" { " · plays in 2D mode" } else { "" }));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").clicked() { self.selected_custom = None; }
+                            let launch = egui::Button::new(egui::RichText::new("▶ Launch").strong().color(egui::Color32::from_rgb(6, 24, 22))).fill(ACCENT);
+                            if ui.add(launch).clicked() { self.pending = Some(Pending::Custom(g.clone())); }
+                        });
+                    });
+                });
+            }
+        }
+    }
+
+    /// The Steam-style cover-art grid.
+    fn library_grid(&mut self, ui: &mut egui::Ui, needle: &str) {
+        let custom: Vec<CustomGame> = self.custom_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(needle)).cloned().collect();
+        let steam: Vec<Game> = self.steam_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(needle)).cloned().collect();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if !custom.is_empty() {
+                ui.label(egui::RichText::new("Custom games").size(17.0).strong().color(ACCENT));
+                ui.horizontal(|ui| { for g in &custom { self.custom_tile(ui, g); } });
+                ui.add_space(8.0);
+            }
+            ui.label(egui::RichText::new("Steam games").size(17.0).strong().color(ACCENT));
+            ui.small("Cover art comes from Steam. Click a game for details; ▶ launches, 2D plays it on the big screen.");
+            if steam.is_empty() { ui.label("No Steam games found. Check Doctor — Steam may not be installed yet."); }
+            let cols = (((ui.available_width() + 14.0) / 176.0) as usize).max(1);
+            for chunk in steam.chunks(cols) {
+                ui.horizontal(|ui| { for g in chunk { self.steam_tile(ui, g); } });
+                ui.add_space(8.0);
+            }
+        });
+    }
+
+    fn steam_tile(&mut self, ui: &mut egui::Ui, g: &Game) {
+        ui.vertical(|ui| {
+            ui.set_width(162.0);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(150.0, 225.0), egui::Sense::click());
+            match self.texture_for(ui.ctx(), g.appid) {
+                Some(tex) => { ui.put(rect, egui::Image::new(&tex).fit_to_exact_size(rect.size())); }
+                None => {
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(rect, egui::Rounding::same(8.0), tile_color(g.appid));
+                    let letter = g.name.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
+                    p.text(rect.center() - egui::vec2(0.0, 16.0), egui::Align2::CENTER_CENTER, letter, egui::FontId::proportional(64.0), egui::Color32::from_white_alpha(220));
+                    p.text(rect.center() + egui::vec2(0.0, 54.0), egui::Align2::CENTER_CENTER, "VRDoctor", egui::FontId::proportional(13.0), egui::Color32::from_white_alpha(140));
+                }
+            }
+            if self.selected_steam == Some(g.appid) {
+                ui.painter().rect_stroke(rect, egui::Rounding::same(8.0), egui::Stroke::new(2.5, ACCENT));
+            }
+            if resp.clicked() { self.selected_steam = Some(g.appid); self.selected_custom = None; }
+            ui.label(egui::RichText::new(truncate_name(&g.name, 24)).strong());
+            ui.horizontal(|ui| {
+                let (sup, _) = classify_game(g, false);
+                badge(ui, sup);
+                if ui.small_button("▶ Launch").clicked() { self.pending = Some(Pending::Steam(g.appid)); }
+                if ui.small_button("2D").clicked() { self.pending = Some(Pending::Steam2d(g.appid)); }
+            });
+        });
+    }
+
+    fn custom_tile(&mut self, ui: &mut egui::Ui, g: &CustomGame) {
+        ui.vertical(|ui| {
+            ui.set_width(162.0);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(150.0, 225.0), egui::Sense::click());
+            let seed = g.name.bytes().fold(0u64, |a, b| a.wrapping_add(b as u64).wrapping_mul(31));
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, egui::Rounding::same(8.0), tile_color(seed));
+            let letter = g.name.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
+            p.text(rect.center() - egui::vec2(0.0, 16.0), egui::Align2::CENTER_CENTER, letter, egui::FontId::proportional(64.0), egui::Color32::from_white_alpha(220));
+            p.text(rect.center() + egui::vec2(0.0, 54.0), egui::Align2::CENTER_CENTER, if g.mode == "2d" { "2D · custom" } else { "custom game" }, egui::FontId::proportional(13.0), egui::Color32::from_white_alpha(160));
+            if self.selected_custom.as_deref() == Some(g.name.as_str()) {
+                ui.painter().rect_stroke(rect, egui::Rounding::same(8.0), egui::Stroke::new(2.5, ACCENT));
+            }
+            if resp.clicked() { self.selected_custom = Some(g.name.clone()); self.selected_steam = None; }
+            ui.label(egui::RichText::new(truncate_name(&g.name, 24)).strong());
+            ui.horizontal(|ui| {
+                if ui.small_button("▶ Launch").clicked() { self.pending = Some(Pending::Custom(g.clone())); }
+            });
+        });
+    }
+
+    /// The classic card list (kept as the List view).
+    fn library_list(&mut self, ui: &mut egui::Ui, needle: &str) {
         ui.heading("Custom games (not from a store)");
         if self.custom_games.is_empty() {
             ui.label("None yet — use the “Add custom game” tab to add any local game, store or not.");
         }
         let mut to_launch: Option<CustomGame> = None;
         let mut to_remove: Option<String> = None;
-        for g in self.custom_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(&needle)) {
+        for g in self.custom_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(needle)) {
             card(ui, |ui| { ui.horizontal(|ui| {
                 if ui.button("▶ Launch").clicked() { to_launch = Some(g.clone()); }
                 ui.vertical(|ui| {
@@ -223,11 +432,7 @@ impl VrDoctorApp {
                 if ui.button("🗑").clicked() { to_remove = Some(g.name.clone()); }
             }); });
         }
-        if let Some(g) = to_launch {
-            let mut g = g;
-            if g.backend.is_empty() { g.backend = self.backend.clone(); }
-            self.status = match launch_custom_game(&g, &self.cfg) { Ok(m) => m, Err(e) => e };
-        }
+        if let Some(g) = to_launch { self.pending = Some(Pending::Custom(g)); }
         if let Some(name) = to_remove {
             self.status = match remove_custom_game(&name) {
                 Ok(true) => format!("Removed custom game '{name}'."),
@@ -238,14 +443,7 @@ impl VrDoctorApp {
         }
 
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.heading("Steam games");
-            if ui.button("🔍 Check Steam online (VR or 2D?)").clicked() {
-                let mut known = 0;
-                for g in &self.steam_games { if classify_game(g, true).0 != VrSupport::Unknown { known += 1; } }
-                self.status = format!("Checked Steam: {known}/{} games classified. Badges: [VR] VR-only · [VR+2D] plays both ways · [2D] flat game · [?] not checked.", self.steam_games.len());
-            }
-        });
+        ui.heading("Steam games");
         ui.small("VRDoctor auto-detects whether each Steam game is VR or 2D. Launching a 2D game sends it to the big screen automatically.");
         if self.steam_games.is_empty() {
             ui.label("No Steam games found. Check Doctor — Steam may not be installed yet.");
@@ -253,7 +451,7 @@ impl VrDoctorApp {
         let mut steam_launch: Option<Game> = None;
         let mut steam_launch_2d: Option<Game> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for g in self.steam_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(&needle)) {
+            for g in self.steam_games.iter().filter(|g| needle.is_empty() || g.name.to_lowercase().contains(needle)) {
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.button("▶ Launch").clicked() { steam_launch = Some(g.clone()); }
@@ -266,12 +464,8 @@ impl VrDoctorApp {
                 });
             }
         });
-        if let Some(g) = steam_launch {
-            self.status = match launch_steam_appid(g.appid, &self.backend.clone()) { Ok(m) => m, Err(e) => e };
-        }
-        if let Some(g) = steam_launch_2d {
-            self.status = match launch_steam_2d(g.appid, &self.backend.clone()) { Ok(m) => m, Err(e) => e };
-        }
+        if let Some(g) = steam_launch { self.pending = Some(Pending::Steam(g.appid)); }
+        if let Some(g) = steam_launch_2d { self.pending = Some(Pending::Steam2d(g.appid)); }
     }
 
     fn doctor_tab(&mut self, ui: &mut egui::Ui) {

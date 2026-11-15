@@ -99,7 +99,7 @@ vrdoctor gui
 ```
 
 - **Dark mode by default.** The 🌙 toggle in the header switches to light and remembers your choice (`theme=` in `~/.config/vrdoctor/config.conf`).
-- **Games tab** — search, launch Steam games (VR or ▶ 2D) and custom games, remove custom games, start the backend.
+- **Library tab** — a Steam-style library: a cover-art grid (artwork is fetched from Steam and cached in `~/.cache/vrdoctor/art`; games without art get a coloured initial tile), click a game for its detail bar with a big ▶ Launch button, coloured VR / VR+2D / 2D badges on every game, and a Grid/List view toggle. Search, launch (VR or ▶ 2D), and custom games all live here too.
 - **Doctor tab** — the full readiness checklist with pass/fail for each item.
 - **Add custom game tab** — add non-store games, with a VR / 2D mode selector (see below).
 - **VR Shell tab** — install VR Home (with brightness slider) and start 2D mode / the bar.

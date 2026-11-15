@@ -444,6 +444,43 @@ pub(crate) fn launch_steam_auto(appid: u64, backend: &str, cfg: &Config) -> Resu
     }
 }
 
+// ------------------------------------------------------- Steam cover art
+
+/// Where downloaded Steam capsule art is cached (~/.cache/vrdoctor/art).
+pub(crate) fn art_dir() -> PathBuf {
+    let base = env::var("XDG_CACHE_HOME").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".cache"));
+    base.join("vrdoctor/art")
+}
+
+pub(crate) fn art_path(appid: u64) -> PathBuf { art_dir().join(format!("{appid}.jpg")) }
+
+/// Steam CDN artwork for a game, best first: portrait library capsule,
+/// then the wide capsule, then the header.
+pub(crate) fn art_candidates(appid: u64) -> Vec<String> {
+    ["library_600x900.jpg", "capsule_616x353.jpg", "header.jpg"].iter()
+        .map(|f| format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/{f}"))
+        .collect()
+}
+
+/// Download a game's Steam capsule art into the cache (via curl).
+/// Writes to a .part file and renames, so readers never see a partial file.
+pub(crate) fn download_art(appid: u64) -> bool {
+    let dir = art_dir();
+    if fs::create_dir_all(&dir).is_err() { return false; }
+    let tmp = dir.join(format!("{appid}.part"));
+    for url in art_candidates(appid) {
+        let ok = std::process::Command::new("curl")
+            .args(["-fsSL", "--max-time", "10", "-o"])
+            .arg(&tmp).arg(&url)
+            .status().map(|s| s.success()).unwrap_or(false);
+        if ok && fs::metadata(&tmp).map(|m| m.len() > 3000).unwrap_or(false)
+            && fs::rename(&tmp, art_path(appid)).is_ok() { return true; }
+    }
+    let _ = fs::remove_file(&tmp);
+    false
+}
+
 // ---------------------------------------------------------------- custom games
 
 /// A game that is not on Steam or any other store. `path` can point at
@@ -1933,6 +1970,16 @@ mod tests {
             assert!(meta.len() > 10_000, "theme {theme} panorama suspiciously small");
         }
         assert!(home_install("bogus-theme", 1.10).is_err());
+    }
+
+    #[test]
+    #[test]
+    fn art_candidates_and_paths() {
+        let c = art_candidates(450390);
+        assert_eq!(c.len(), 3);
+        assert!(c[0].ends_with("/450390/library_600x900.jpg"));
+        assert!(c[1].ends_with("/450390/capsule_616x353.jpg"));
+        assert!(art_path(450390).ends_with("vrdoctor/art/450390.jpg"));
     }
 
     #[test]
