@@ -1067,8 +1067,26 @@ fn executable_rank(path: &Path) -> u32 {
     }
 }
 
+/// Executables that ship *next to* a game but are not the game: crash
+/// handlers, uninstallers, redistributable installers. Picking one of
+/// these was the "SUPERHOT VR launches UnityCrashHandler64.exe" bug —
+/// same kind, same folder, so the old first-found-wins scan flipped a coin.
+pub(crate) fn is_helper_exe(path: &Path) -> bool {
+    let n = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+    n.contains("crashhandler") || n.contains("crashpad") || n.contains("crash_handler")
+        || n.starts_with("unins") || n.contains("websetup")
+        || n.starts_with("vcredist") || n.starts_with("vc_redist")
+}
+
+/// Letters+digits only, lowercased — for comparing a file name with the
+/// name of the folder it lives in ("SUPERHOT_VR" vs "SUPERHOT VR").
+fn name_key(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
 pub(crate) fn find_executable_in(dir: &Path) -> Option<PathBuf> {
-    fn walk(dir: &Path, depth: u32, best: &mut Option<(u32, PathBuf)>) {
+    let root_key = name_key(&dir.file_name().unwrap_or_default().to_string_lossy());
+    fn walk(dir: &Path, depth: u32, root_key: &str, best: &mut Option<(i32, PathBuf)>) {
         if depth > 3 { return; }
         let Ok(entries) = fs::read_dir(dir) else { return };
         for e in entries.flatten() {
@@ -1077,19 +1095,38 @@ pub(crate) fn find_executable_in(dir: &Path) -> Option<PathBuf> {
                 // Skip obvious non-game subtrees.
                 let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
                 if ["__macosx", ".git", "docs", "documentation"].contains(&n.as_str()) { continue; }
-                walk(&p, depth + 1, best);
+                walk(&p, depth + 1, root_key, best);
             } else {
                 let rank = executable_rank(&p);
-                if rank < 99 {
-                    // Prefer shallower, higher-ranked files; a file named like the folder wins ties.
-                    let score = rank * 10 + depth;
-                    if best.as_ref().map(|(s, _)| score < *s).unwrap_or(true) { *best = Some((score, p)); }
+                if rank >= 99 { continue; }
+                // Lower is better: kind rank dominates, shallower wins ties.
+                let mut score = rank as i32 * 100 + depth as i32;
+                let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+                let stem_key = name_key(&stem);
+                // Named like the folder it sits in (or the folder the user
+                // picked) → almost certainly the game itself.
+                let parent_key = name_key(&dir.file_name().unwrap_or_default().to_string_lossy());
+                if !stem_key.is_empty() && (stem_key == parent_key || stem_key == root_key || root_key.starts_with(&stem_key)) {
+                    score -= 50;
                 }
+                // A Unity game root: <stem>_Data next to the exe is the
+                // game's own data folder; UnityPlayer.dll marks the folder
+                // as a Unity game root too.
+                if p.parent().map(|d| d.join(format!("{stem}_Data")).is_dir()).unwrap_or(false) {
+                    score -= 40;
+                }
+                if !is_helper_exe(&p) && p.parent().map(|d| d.join("UnityPlayer.dll").is_file()).unwrap_or(false) {
+                    score -= 10;
+                }
+                // Helpers (crash handlers, uninstallers, redist installers)
+                // only ever win when nothing else exists.
+                if is_helper_exe(&p) { score += 500; }
+                if best.as_ref().map(|(s, _)| score < *s).unwrap_or(true) { *best = Some((score, p)); }
             }
         }
     }
     let mut best = None;
-    walk(dir, 0, &mut best);
+    walk(dir, 0, &root_key, &mut best);
     best.map(|(_, p)| p)
 }
 
@@ -1505,6 +1542,22 @@ fn launch_custom_game_impl(game: &CustomGame, cfg: &Config, mode2d: bool) -> Res
     let backend = if game.backend.is_empty() { cfg.backend.clone() } else { game.backend.clone() };
     if !game.path.exists() {
         return Err(format!("Custom game '{}': file not found at {}", game.name, game.path.display()));
+    }
+    // Self-heal entries saved before the folder scan learned to avoid
+    // helper programs: if the stored path IS a helper (e.g. Unity's crash
+    // handler), re-pick the real game from the same folder and launch that.
+    if is_helper_exe(&game.path) {
+        if let Some(parent) = game.path.parent() {
+            if let Some(better) = find_executable_in(parent) {
+                if better != game.path {
+                    let mut g = game.clone();
+                    let note = format!("'{}' is a helper program, not the game — launching {} instead.", game.path.file_name().unwrap_or_default().to_string_lossy(), better.display());
+                    g.path = better;
+                    let inner = launch_custom_game_impl(&g, cfg, mode2d)?;
+                    return Ok(format!("{note}\n{inner}"));
+                }
+            }
+        }
     }
     let kind = detect_kind(&game.path);
 
@@ -2517,6 +2570,28 @@ mod tests {
     #[test]
 
     #[test]
+
+    #[test]
+    fn folder_scan_picks_the_game_not_the_crash_handler() {
+        // Replica of a real Unity game folder (SUPERHOT VR): the game exe
+        // is a small stub sitting next to the LARGER UnityCrashHandler64.exe.
+        // The scan must pick SUPERHOT_VR.exe regardless of listing order.
+        let base = unique_temp("vrdoctor-scan-test");
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("Superhot VR-183");
+        let game_dir = root.join("SUPERHOT VR");
+        fs::create_dir_all(game_dir.join("SUPERHOT_VR_Data")).unwrap();
+        // Crash handler written first — the order that broke on real hardware.
+        fs::write(game_dir.join("UnityCrashHandler64.exe"), b"MZ").unwrap();
+        fs::write(game_dir.join("SUPERHOT_VR.exe"), b"MZ").unwrap();
+        fs::write(game_dir.join("UnityPlayer.dll"), b"dll").unwrap();
+        fs::write(root.join("Run_Me.bat"), b"@echo off").unwrap();
+        let found = find_executable_in(&root).unwrap();
+        assert_eq!(found, game_dir.join("SUPERHOT_VR.exe"));
+        assert!(is_helper_exe(&game_dir.join("UnityCrashHandler64.exe")));
+        assert!(!is_helper_exe(&game_dir.join("SUPERHOT_VR.exe")));
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn version_parsing_and_ordering() {
