@@ -6,9 +6,9 @@ use eframe::egui;
 use std::path::PathBuf;
 
 use crate::{
-    art_path, capture, classify_game, config_dir, current_distro, download_art, fix_openvr, home_install, install_done, launch_steam_2d, list_games,
+    art_path, capture, classify_game, current_distro, download_art, fix_openvr, home_install, install_done, launch_steam_2d, list_games,
     load_config, load_custom_games, mark_installed, quest_setup_steps, register_custom_game, remove_custom_game,
-    install_plan, register_vr_desktop, run_checks, run_installer_terminal, save_config, setup_plan, setup_plan_for_family, start_backend, start_bar,
+    install_plan, register_vr_desktop, run_checks, uninstall_user_files, run_installer_terminal, save_config, setup_plan, setup_plan_for_family, start_backend, start_bar,
     start_overlay, launch_custom_game, launch_steam_appid, CheckResult, Config, CustomGame, Family, Game, VrSupport,
     HOME_THEMES, SUPPORTED_KINDS,
 };
@@ -108,30 +108,6 @@ enum Tab { Games, Doctor, AddGame, Shell, Setup }
 /// the UI pass so borrows stay simple.
 enum Pending { Steam(u64), Steam2d(u64), Custom(CustomGame) }
 
-/// Remove everything VRDoctor created in the user's own folders:
-/// its config/settings (incl. custom games and VR Home panoramas), the
-/// extracted-games library, the cover-art cache, and its desktop
-/// entries. System packages (WiVRn, Steam, …) are shared with other
-/// apps and are deliberately left alone. Returns a report of what went.
-fn uninstall_user_files() -> Vec<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
-    let cache_home = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{home}/.cache"));
-    let mut report = Vec::new();
-    for f in ["vrdoctor.desktop", "vrdoctor-vr.desktop"] {
-        let p = PathBuf::from(&data_home).join("applications").join(f);
-        if p.exists() {
-            match std::fs::remove_file(&p) { Ok(()) => report.push(format!("Removed {}", p.display())), Err(e) => report.push(format!("Could not remove {}: {e}", p.display())) }
-        }
-    }
-    for d in [config_dir(), PathBuf::from(&data_home).join("vrdoctor"), PathBuf::from(&cache_home).join("vrdoctor")] {
-        if d.exists() {
-            match std::fs::remove_dir_all(&d) { Ok(()) => report.push(format!("Removed {}", d.display())), Err(e) => report.push(format!("Could not remove {}: {e}", d.display())) }
-        }
-    }
-    if report.is_empty() { report.push("Nothing to remove — VRDoctor has no files in your user folders.".to_string()); }
-    report
-}
 
 /// Background-download missing Steam cover art, then ask for a repaint.
 fn spawn_art_download(ctx: &egui::Context, appids: Vec<u64>) {

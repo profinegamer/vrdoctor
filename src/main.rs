@@ -256,6 +256,74 @@ impl Default for Config {
     fn default() -> Self { Self { backend: "wivrn".into(), steam_root: None, default_refresh: 90, theme: "dark".into(), accent: "teal".into(), proton: None } }
 }
 
+
+// ---------------------------------------------------------------- uninstall
+
+/// The locations VRDoctor keeps its own files in: (config dir, legacy
+/// config dir, XDG data home, XDG cache home). Empty XDG variables are
+/// treated as unset, per the XDG spec.
+fn uninstall_roots() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+    let xdg = |key: &str, fallback: PathBuf| -> PathBuf {
+        match env::var(key) { Ok(v) if !v.trim().is_empty() => PathBuf::from(v), _ => fallback }
+    };
+    (config_dir(), legacy_config_dir(), xdg("XDG_DATA_HOME", home.join(".local/share")), xdg("XDG_CACHE_HOME", home.join(".cache")))
+}
+
+/// Remove everything VRDoctor created in the user's own folders: its
+/// config/settings (incl. custom games, VR Home panoramas and the
+/// legacy quest3-launcher config), the extracted-games library, the
+/// cover-art cache, and its desktop entries (including the WiVRn one).
+/// System packages (WiVRn, Steam, ...) are shared with other apps and
+/// deliberately left alone. Path-parameterised so tests can run it
+/// against a scratch tree; returns a human-readable report.
+fn uninstall_at(config: &Path, legacy: &Path, data_home: &Path, cache_home: &Path) -> Vec<String> {
+    let mut report = Vec::new();
+    for f in ["vrdoctor.desktop", "vrdoctor-vr.desktop"] {
+        let p = data_home.join("applications").join(f);
+        if p.exists() {
+            match fs::remove_file(&p) { Ok(()) => report.push(format!("Removed {}", p.display())), Err(e) => report.push(format!("Could not remove {}: {e}", p.display())) }
+        }
+    }
+    for d in [config.to_path_buf(), legacy.to_path_buf(), data_home.join("vrdoctor"), cache_home.join("vrdoctor")] {
+        if d.exists() {
+            match fs::remove_dir_all(&d) { Ok(()) => report.push(format!("Removed {}", d.display())), Err(e) => report.push(format!("Could not remove {}: {e}", d.display())) }
+        }
+    }
+    if report.is_empty() { report.push("Nothing to remove — VRDoctor has no files in your user folders.".to_string()); }
+    report
+}
+
+pub(crate) fn uninstall_user_files() -> Vec<String> {
+    let (config, legacy, data_home, cache_home) = uninstall_roots();
+    uninstall_at(&config, &legacy, &data_home, &cache_home)
+}
+
+/// What an uninstall would remove (the CLI's dry run).
+fn uninstall_targets() -> Vec<PathBuf> {
+    let (config, legacy, data_home, cache_home) = uninstall_roots();
+    let mut v = vec![
+        data_home.join("applications/vrdoctor.desktop"),
+        data_home.join("applications/vrdoctor-vr.desktop"),
+        config, legacy, data_home.join("vrdoctor"), cache_home.join("vrdoctor"),
+    ];
+    v.retain(|p| p.exists());
+    v
+}
+
+fn cmd_uninstall(args: &[String]) {
+    if !args.iter().any(|a| a == "--yes") {
+        let targets = uninstall_targets();
+        if targets.is_empty() { println!("Nothing to remove — VRDoctor has no files in your user folders."); return; }
+        println!("This removes VRDoctor's own files (system packages like WiVRn are left alone):");
+        for t in targets { println!("  {}", t.display()); }
+        println!("\nNothing was removed. Run `vrdoctor uninstall --yes` to go ahead — and delete the VRDoctor AppImage file itself afterwards.");
+        return;
+    }
+    for line in uninstall_user_files() { println!("{line}"); }
+    println!("\nDone. The VR packages (WiVRn and friends) were left in place — remove them with your package manager if you want them gone. Delete the VRDoctor AppImage file itself to finish.");
+}
+
 pub(crate) fn config_dir() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".config"))
@@ -1961,6 +2029,7 @@ USAGE:
   vrdoctor devices                  Detect Quest 3 over USB (adb)
   vrdoctor fix-openvr [--undo]      Stop a (broken) SteamVR from hijacking OpenVR games — route them to WiVRn/xrizer
   vrdoctor fix-steam              Let Flatpak Steam see WiVRn (sandbox overrides + runtime symlink) so games open in the headset, not flat on the monitor
+  vrdoctor uninstall [--yes]      Remove VRDoctor's own files (settings, caches, menu entries); without --yes it only lists what would go
   vrdoctor list-games [--online]    Steam games grouped VR / VR+2D / 2D + custom (non-store) games
   vrdoctor list-games --json        The same list as JSON (used by vrdoctor-vr, the in-headset UI)
   vrdoctor vr [--register-only]     Open the VRDoctor library inside the headset (a real OpenXR app
@@ -2063,6 +2132,7 @@ fn main() {
             match fix_flatpak_steam_visibility() { Ok(m) => println!("{m}"), Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
         }
         "vr" => cmd_vr(&args[1..]),
+        "uninstall" => cmd_uninstall(&args[1..]),
         "add-game" => add_game_cli(&args[1..]),
         "remove-game" => remove_game_cli(&args[1..]),
         "launch" | "play" => launch(&args[1..]),
@@ -2296,6 +2366,28 @@ mod tests {
     }
 
     #[test]
+
+    #[test]
+    fn uninstall_removes_all_user_files() {
+        let base = std::env::temp_dir().join(format!("vrdoctor-uninstall-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let config = base.join("config/vrdoctor");
+        let legacy = base.join("config/quest3-launcher");
+        let data = base.join("data");
+        let cache = base.join("cache");
+        for d in [&config, &legacy, &data.join("applications"), &data.join("vrdoctor/library"), &cache.join("vrdoctor/art")] { fs::create_dir_all(d).unwrap(); }
+        fs::write(config.join("config.conf"), "backend=wivrn\n").unwrap();
+        fs::write(data.join("applications/vrdoctor-vr.desktop"), "[Desktop Entry]\n").unwrap();
+        fs::write(cache.join("vrdoctor/art/730.jpg"), "x").unwrap();
+        let report = uninstall_at(&config, &legacy, &data, &cache);
+        assert!(!config.exists() && !legacy.exists() && !data.join("vrdoctor").exists() && !cache.join("vrdoctor").exists());
+        assert!(!data.join("applications/vrdoctor-vr.desktop").exists());
+        assert!(report.iter().filter(|l| l.starts_with("Removed")).count() >= 4, "{report:?}");
+        let again = uninstall_at(&config, &legacy, &data, &cache);
+        assert!(again[0].starts_with("Nothing to remove"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
     fn steam_flavour_prefers_library_owner() {
         // The user's exact case: Flatpak Steam has the games, native was
         // freshly installed by VRDoctor and has none → Flatpak wins.

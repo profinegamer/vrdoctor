@@ -121,10 +121,21 @@ Under the hood it's a native OpenXR app (`vrdoctor-vr`, OpenGL via EGL) that rea
 If your Steam is the Flatpak (`com.valvesoftware.Steam`), VRDoctor uses it as-is: it detects which Steam actually holds your games, launches through `flatpak run com.valvesoftware.Steam`, and **never installs a duplicate native Steam** (the install plan skips the Steam package when any Steam is already present). Because Flatpak Steam is sandboxed, it also can't see WiVRn by default — `vrdoctor install` applies the documented visibility fix automatically for Flatpak users, and you can re-apply it any time with:
 
 ```bash
-vrdoctor fix-flatpak
+vrdoctor fix-steam
 ```
 
 That grants Steam read access to `xdg-run/wivrn`, `xdg-config/openxr` and `xdg-config/openvr` and links your OpenXR config into the sandbox.
+
+## Uninstalling
+
+In the app: **Setup tab → Uninstall** (two clicks, with a warning). From a terminal:
+
+```bash
+vrdoctor uninstall          # lists what would be removed, changes nothing
+vrdoctor uninstall --yes    # actually removes it
+```
+
+Both remove VRDoctor's own files — settings, custom games, VR Home, caches, and its menu entries (including the WiVRn one) — and then you just delete the AppImage file itself. The system packages it installed (WiVRn and friends) are shared with other apps and are left in place; the uninstall output tells you how to remove those too if you want them gone.
 
 Building the GUI needs X11/Wayland headers on some systems — Fedora: `sudo dnf install libXcursor-devel libXi-devel libXrandr-devel libxkbcommon-devel wayland-devel`. Arch usually has what's needed via base-devel and desktop deps.
 
