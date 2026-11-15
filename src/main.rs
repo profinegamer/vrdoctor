@@ -1522,6 +1522,27 @@ fn apply_vr_env(cmd: &mut Command, backend: &str, container: bool) {
     }
 }
 
+/// Stdio that appends a launched game's output to
+/// ~/.cache/vrdoctor/launch.log (with a header naming the game).
+/// Desktop launches otherwise lose the game's output entirely —
+/// VRDoctor is usually started from a menu, so the child's stdout
+/// goes nowhere, and with it every diagnostic the game, Proton, umu
+/// and the VR runtime print while starting. (In-headset launches
+/// have their own log, vr-launch.log, written by vr.rs.)
+fn game_log_stdio(game_name: &str) -> Option<(Stdio, Stdio)> {
+    use std::io::Write;
+    let cache = env::var("XDG_CACHE_HOME").map(PathBuf::from).ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".cache"));
+    let dir = cache.join("vrdoctor");
+    fs::create_dir_all(&dir).ok()?;
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(dir.join("launch.log")).ok()?;
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = writeln!(f, "\n===== vrdoctor launch: {game_name} (unix {secs}) =====");
+    let f2 = f.try_clone().ok()?;
+    Some((Stdio::from(f), Stdio::from(f2)))
+}
+
 pub(crate) fn launch_steam_appid(appid: u64, backend: &str) -> Result<String, String> {
     let msg = start_backend(backend);
     let flavour = detect_steam_flavour(&load_config());
@@ -1715,7 +1736,14 @@ fn launch_custom_game_impl(game: &CustomGame, cfg: &Config, mode2d: bool) -> Res
         if route_note.is_empty() { base.to_string() } else { format!("{base} ({route_note})") }
     };
     let screen = if mode2d { " on the big screen in VR (2D mode — look at the desktop panel; the VRDoctor bar sits under it)" } else { "" };
-    cmd.spawn().map(|_| format!("{msg}\nLaunched custom game '{}' ({:?}, {}) via {backend}{how}{screen}.", game.name, kind, game.path.display()))
+    // Capture the game's output to ~/.cache/vrdoctor/launch.log — when
+    // a launch dies silently, that file is where the evidence is.
+    let logged = match game_log_stdio(&game.name) {
+        Some((out, err)) => { cmd.stdout(out).stderr(err); true }
+        None => false,
+    };
+    let log_note = if logged { " Game output is being written to ~/.cache/vrdoctor/launch.log." } else { "" };
+    cmd.spawn().map(|_| format!("{msg}\nLaunched custom game '{}' ({:?}, {}) via {backend}{how}{screen}.{log_note}", game.name, kind, game.path.display()))
         .map_err(|e| format!("Failed to launch '{}': {e}", game.name))
 }
 
