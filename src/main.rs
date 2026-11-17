@@ -1780,13 +1780,22 @@ pub(crate) fn vrpath_runtimes(content: &str) -> Vec<String> {
 }
 
 pub(crate) fn build_vrpath(runtime: &Path) -> String {
-    format!("{{\n\t\"config\" : [],\n\t\"external_drivers\" : null,\n\t\"jsonid\" : \"vrpathreg\",\n\t\"log\" : [],\n\t\"runtime\" : [\n\t\t\"{}\"\n\t],\n\t\"version\" : 1\n}}", runtime.display())
+    build_vrpath_multi(&[runtime.display().to_string()])
+}
+
+/// Registry file with several runtimes, in load order (first entry wins).
+pub(crate) fn build_vrpath_multi(runtimes: &[String]) -> String {
+    let entries = runtimes.iter().map(|r| format!("\t\t\"{}\"", r)).collect::<Vec<_>>().join(",\n");
+    format!("{{\n\t\"config\" : [],\n\t\"external_drivers\" : null,\n\t\"jsonid\" : \"vrpathreg\",\n\t\"log\" : [],\n\t\"runtime\" : [\n{}\n\t],\n\t\"version\" : 1\n}}", entries)
 }
 
 /// Find an xrizer / OpenComposite runtime on this system (the OpenVR→OpenXR
 /// translators that replace SteamVR for WiVRn).
 pub(crate) fn find_openvr_runtime() -> Option<PathBuf> {
-    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+    find_openvr_runtime_in(&PathBuf::from(env::var("HOME").unwrap_or_default()))
+}
+
+pub(crate) fn find_openvr_runtime_in(home: &Path) -> Option<PathBuf> {
     let mut candidates = vec![
         home.join(".local/share/xrizer"),
         PathBuf::from("/usr/share/xrizer"),
@@ -1795,13 +1804,24 @@ pub(crate) fn find_openvr_runtime() -> Option<PathBuf> {
         PathBuf::from("/usr/share/opencomposite"),
         PathBuf::from("/usr/local/share/opencomposite"),
     ];
-    // WiVRn Flatpak bundles OpenComposite/xrizer.
-    for base in [home.join(".local/share/flatpak/app/io.github.wivrn.wivrn/current/active/files/share"),
-                 PathBuf::from("/var/lib/flatpak/app/io.github.wivrn.wivrn/current/active/files/share")] {
-        candidates.push(base.join("opencomposite"));
+    // WiVRn Flatpak bundles OpenComposite/xrizer at the files root
+    // (files/xrizer, files/OpenComposite) — not under files/share.
+    for base in [home.join(".local/share/flatpak/app/io.github.wivrn.wivrn/current/active/files"),
+                 PathBuf::from("/var/lib/flatpak/app/io.github.wivrn.wivrn/current/active/files")] {
+        candidates.push(base.join("OpenComposite"));
         candidates.push(base.join("xrizer"));
     }
     candidates.into_iter().find(|p| p.is_dir())
+}
+
+/// SteamVR runtime entries worth keeping in the registry when fix-openvr
+/// rewrites it: SteamVR itself needs to stay listed so its own startup
+/// gate passes (it loads its own runtime via VR_OVERRIDE); games still
+/// reach xrizer because it stays first.
+pub(crate) fn steamvr_runtimes_to_keep(content: &str) -> Vec<String> {
+    vrpath_runtimes(content).into_iter()
+        .filter(|r| r.to_lowercase().contains("steamvr"))
+        .collect()
 }
 
 pub(crate) fn openvr_routing_status() -> (bool, String) {
@@ -1816,7 +1836,8 @@ pub(crate) fn openvr_routing_status() -> (bool, String) {
     let good = lower.iter().any(|r| r.contains("xrizer") || r.contains("opencomposite") || r.contains("wivrn") || r.contains("monado"));
     let only_steamvr = lower.iter().all(|r| r.contains("steamvr") || r.contains("steamapps/common/steamvr"));
     if good {
-        (true, format!("OpenVR games route to {} (not SteamVR)", runtimes.join(", ")))
+        let translators: Vec<&str> = runtimes.iter().map(|r| r.as_str()).filter(|r| { let l = r.to_lowercase(); l.contains("xrizer") || l.contains("opencomposite") || l.contains("wivrn") || l.contains("monado") }).collect();
+        (true, format!("OpenVR games route to {} (not SteamVR)", translators.join(", ")))
     } else if only_steamvr {
         (false, format!("openvrpaths.vrpath points ONLY at SteamVR ({}) — a broken SteamVR can hijack your OpenVR games. Fix: vrdoctor fix-openvr", runtimes.join(", ")))
     } else {
@@ -1834,12 +1855,23 @@ pub(crate) fn fix_openvr() -> Result<String, String> {
     }
     if let Some(runtime) = find_openvr_runtime() {
         if let Some(parent) = p.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+        // Keep a SteamVR entry, second after xrizer, if one is already
+        // listed: SteamVR's own startup gate requires it to be registered,
+        // and it loads itself via VR_OVERRIDE, so games still reach xrizer
+        // first. Dropping it would break SteamVR outright.
+        let mut runtimes = vec![runtime.display().to_string()];
+        if let Ok(current) = fs::read_to_string(&p) {
+            for keep in steamvr_runtimes_to_keep(&current) {
+                if !runtimes.contains(&keep) { runtimes.push(keep); }
+            }
+        }
         // Remove a previous read-only lock so we can write.
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; if let Ok(m) = fs::metadata(&p) { let mut perms = m.permissions(); perms.set_mode(0o644); let _ = fs::set_permissions(&p, perms); } }
-        fs::write(&p, build_vrpath(&runtime)).map_err(|e| e.to_string())?;
+        fs::write(&p, build_vrpath_multi(&runtimes)).map_err(|e| e.to_string())?;
         // Lock it: SteamVR re-adds itself to this file if it can write to it.
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; if let Ok(m) = fs::metadata(&p) { let mut perms = m.permissions(); perms.set_mode(0o444); let _ = fs::set_permissions(&p, perms); } }
-        Ok(format!("OpenVR now routes to {} ({}).\nThe file is locked read-only so SteamVR can't hijack it back. Backup of the original: {}\nUndo any time with: vrdoctor fix-openvr --undo", runtime.display(), p.display(), backup.display()))
+        let kept = if runtimes.len() > 1 { format!(" SteamVR stays listed second so SteamVR itself can still start (it loads its own runtime via VR_OVERRIDE).") } else { String::new() };
+        Ok(format!("OpenVR now routes to {} ({}).{} The file is locked read-only so SteamVR can't hijack it back. Backup of the original: {}\nUndo any time with: vrdoctor fix-openvr --undo", runtime.display(), p.display(), kept, backup.display()))
     } else if p.exists() {
         // No translator found: removing the file is the documented workaround —
         // WiVRn ≥ 0.23 manages the paths itself when the headset connects.
@@ -2791,5 +2823,33 @@ mod tests {
         assert!(flat.contains("flatpak") && flat.contains("com.valvesoftware.Steam") && flat.contains("275850"), "{flat}");
         let nat = format!("{:?}", steam_launch_command(SteamFlavour::Native, 275850));
         assert!(nat.contains("\"steam\"") && nat.contains("275850"), "{nat}");
+    }
+
+    #[test]
+    fn find_openvr_runtime_in_wivrn_flatpak() {
+        // The user's exact layout: WiVRn Flatpak bundles xrizer at the
+        // files root (files/xrizer), not under files/share.
+        let home = unique_temp("wivrn-home");
+        let xrizer = home.join(".local/share/flatpak/app/io.github.wivrn.wivrn/current/active/files/xrizer");
+        fs::create_dir_all(&xrizer).unwrap();
+        assert_eq!(find_openvr_runtime_in(&home), Some(xrizer));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fix_openvr_keeps_steamvr_entry() {
+        let content = build_vrpath_multi(&[
+            "/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/abc/files/xrizer".to_string(),
+            "/home/shymoth/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/SteamVR".to_string(),
+        ]);
+        // Round-trips in order: xrizer first (games), SteamVR second.
+        assert_eq!(vrpath_runtimes(&content), vec![
+            "/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/abc/files/xrizer".to_string(),
+            "/home/shymoth/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/SteamVR".to_string(),
+        ]);
+        assert_eq!(steamvr_runtimes_to_keep(&content), vec![
+            "/home/shymoth/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/SteamVR".to_string(),
+        ]);
+        assert!(steamvr_runtimes_to_keep("{\"runtime\":[\"/xrizer\"]}").is_empty());
     }
 }
